@@ -1,0 +1,39 @@
+# ===== 运行时产物（下载媒体 / 消息数据 / 缓存，含隐私，禁止上传）=====
+resources/
+dl/
+json/
+
+# ===== Python =====
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# ===== 测试 / 验收输出日志 =====
+*_out.txt
+*.log
+_test/
+
+# ===== 调试探针脚本与临时产物（开发期残留）=====
+_probe_*.py
+_diag_*.py
+_smoke_test.py
+_tdl_*.bin
+tdl-export.json
+
+# ===== 本地部署产物 =====
+tdl.exe
+ffmpeg.exe
+tdlx.cmd
+deploy-state.json
+.tdl/
+
+# ===== 本机专用脚本（含绝对路径）=====
+启动.bat
+
+# ===== IDE / 系统 =====
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini
