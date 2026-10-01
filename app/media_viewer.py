@@ -246,15 +246,23 @@ class ImageCanvas(QWidget):
 # ============================================================================
 # 视频画布（与图片同一套缩放 / 平移 + 画面调节）
 # ============================================================================
-# 播放中调色的处理分辨率上限：成本与像素数成正比，1080p 三项全开约 100 ms/帧
-# （≈10 fps，观感就是卡死），限到 960×540 约 26 ms（≈38 fps）。暂停时不受此限。
-PLAY_MAX_W, PLAY_MAX_H = 960, 540
+# 处理分辨率的**各档上限**（真正的目标由 `_target_size()` 按「屏幕上画多大」算，见下）。
+# ⚠️ 上限只是**兜底**，不是目标：实测「缩放 + QPixmap」只要 5~7 ms，贵的 `toImage()`
+#    跟处理分辨率无关 —— 所以没必要靠压低分辨率来省算力（那是 2.9.8 之前的误区）。
+#    但**也不能完全不设**：不调色时若不限，8K 源会拖垮帧队列（2.9.8 的坑）。
+#   · 播放中 · 调色    1280×720   —— 三项全开约 45 ms/帧；再高就拖不动调色滑块
+#   · 播放中 · 不调色  3840×2160  —— 处理几乎零成本，给足清晰度
+#   · 暂停中 · 不调色  3840×2160
+#   · 暂停中 · 调色    1920×1080  —— **保持 1920 不动**：4K 全量单次调色 420 ms，
+#     拖滑块会不断积压（2.5.4 好不容易调出来的，别放）
+PLAY_MAX_W, PLAY_MAX_H = 1280, 720                # 播放中 · 调色
+PLAY_MAX_W_PLAIN, PLAY_MAX_H_PLAIN = 3840, 2160   # 播放中 · 不调色
+IDLE_MAX_W, IDLE_MAX_H = 3840, 2160               # 暂停中 · 不调色
+IDLE_MAX_W_COLOR, IDLE_MAX_H_COLOR = 1920, 1080   # 暂停中 · 调色
 
-# 暂停时（含放大后细看）的处理上限。**不能不限**：4K 单次调色要 420 ms，
-# 而节流间隔再短也堵不住 → 拖滑块时请求越积越多、最终卡死（用户实测
-# 「视频放大后多次调色还是会卡死」）。降到 1080p 后单次约 100 ms，配合下面的
-# 自适应节流即可稳定输出预览。
-IDLE_MAX_W, IDLE_MAX_H = 1920, 1080
+# 处理分辨率的目标 = 屏幕上真正画出来的尺寸 × 缩放倍率，倍率封顶这么多倍。
+# 放大时需要更多源像素才不糊，但继续往上就只是跟播放帧率抢 CPU 了。
+ZOOM_FOR_QUALITY = 2.0
 
 # 调色重绘的节流下限（实际间隔取 max(此值, 上次耗时×1.2)，见 _schedule_render）
 RENDER_MIN_MS = 80
@@ -268,6 +276,12 @@ TICK_MS = 50
 # 宁可把有效帧率降到 ~24fps，也绝不让队列堆积。
 FRAME_MIN_INTERVAL = 1 / 24            # 调色时
 FRAME_MIN_INTERVAL_PLAIN = 1 / 60      # 未调色时（处理几乎零成本，基本不丢）
+
+# 自适应丢帧系数（2.9.8）：实际间隔 = max(上面的基准, **上帧实测整帧耗时** × 此系数)。
+# ⚠️ 必须量**整帧**（toImage + 缩放 + 调色 + QPixmap），不能只看调色那一段 ——
+#    4K MOV 的瓶颈主要在 `QVideoFrame.toImage()` 的格式转换与整帧拷贝上。
+# 留 40% 余量给绘制与事件调度；这样 40 ms/帧的视频会自动落到 ~18fps，队列不再积压。
+FRAME_COST_FACTOR = 1.4
 
 
 def _apply_color(img: QImage, bright: int, contrast: int, sat: int) -> QImage:
@@ -327,6 +341,7 @@ class VideoCanvas(ImageCanvas):
         self._last_frame = 0.0                    # 最近一次收帧时刻（判断是否在播放）
         self._last_render = 0.0                   # 最近一次处理帧的时刻（丢帧保护用）
         self._render_cost = 0.0                   # 上次渲染实测耗时（自适应节流用）
+        self._frame_cost = 0.0                    # 上帧**整帧**实测耗时（自适应丢帧用）
         self._last_paint = 0.0                    # 上次渲染时刻（节流判据）
         self._dirty = False                       # 有待生效的调色改动
         self._tick = None                         # 节流 tick（见 _ensure_tick）
@@ -385,42 +400,83 @@ class VideoCanvas(ImageCanvas):
     def _on_frame(self, frame) -> None:
         """收帧 → （可调色）→ 显示。
 
-        ⚠️ **丢帧保护**（2.5.3 的关键修复）：处理一帧（`toImage()` 拷贝 + 缩放 +
-        调色 + `QPixmap` 转换）在 1080p 下要 27~40 ms，而视频按 30/60 fps 推帧 ——
-        每帧都处理就会在 Qt 事件队列里**越积越多**，表现就是「刚开始还行，多次调节后
-        越来越卡、最后卡死」（用户实测）。这里直接丢掉来不及处理的帧：宁可把有效
-        帧率降到 ~24fps，也绝不让事件排队堆积（丢帧路径只做一次时间比较，微秒级）。
+        ⚠️ **丢帧保护**：处理一帧（`toImage()` 拷贝 + 缩放 + 调色 + `QPixmap` 转换）
+        在 1080p 下要 27~40 ms、4K 要几十毫秒，而视频按 30/60 fps 推帧 —— 每帧都处理
+        就会在 Qt 事件队列里**越积越多**（每个队列项还攥着帧缓冲），表现就是
+        「越播越卡、内存涨到程序退出」（用户实测）。
+        间隔由 `_frame_gap()` 给：**按上帧实测的整帧耗时自适应**（2.9.8），
+        宁可把有效帧率降下来，也绝不让事件排队堆积。
+        丢帧路径只做一次时间比较（微秒级），所以队列能迅速排空。
         """
         now = time.monotonic()
         self._last_frame = now                     # 供 _is_playing() 判断播放状态
-        gap = (FRAME_MIN_INTERVAL if self._needs_color()
-               else FRAME_MIN_INTERVAL_PLAIN)
-        if now - self._last_render < gap:
+        if now - self._last_render < self._frame_gap():
             return                                 # 丢帧：不拷贝、不调色，立即返回
         self._last_render = now
         if not frame.isValid():
             return
-        img = frame.toImage()
-        if img.isNull():
-            return
-        self._raw = img                            # 留底，调参时不用等下一帧
-        self._render()
+        t0 = now
+        try:
+            img = frame.toImage()
+            if img.isNull():
+                return
+            self._raw = img                        # 留底，调参时不用等下一帧
+            self._render()
+        finally:
+            # 整帧成本（toImage + 缩放 + 调色 + QPixmap）→ 下一帧的自适应间隔
+            self._frame_cost = time.monotonic() - t0
+
+    def _target_size(self, src_w: int, src_h: int) -> tuple[int, int]:
+        """这一帧该按多大分辨率处理 —— 目标是「屏幕上真正画出来的像素数」。
+
+        处理得比屏幕大＝白费算力（还多一道重采样）；比屏幕小＝怎么都要再放大一次、更糊。
+        所以按显示尺寸取（2.9.9 起）：
+          · 适应窗口：画布尺寸 × 设备像素比 × 缩放倍率（倍率封顶 ZOOM_FOR_QUALITY）
+          · 实际尺寸(1:1)：直接按源分辨率 —— 屏幕上就是 1:1 放，要的就是原像素
+        """
+        if not self._fit:
+            return max(1, int(src_w)), max(1, int(src_h))
+        dpr = float(self.devicePixelRatioF() or 1.0)
+        z = max(1.0, min(float(self._zoom or 1.0), ZOOM_FOR_QUALITY))
+        return (max(1, int(round(self.width() * dpr * z))),
+                max(1, int(round(self.height() * dpr * z))))
 
     def _render(self) -> None:
         """按当前参数把最近一帧画出来（保持用户已有的缩放 / 平移视角）。
 
-        ⚠️ 处理分辨率上限分两档（成本与像素数成正比）：
-          · 播放中 960×540（约 26 ms，≈38 fps）—— 流畅优先
-          · 暂停中 1920×1080（约 100 ms）—— 清晰优先，但仍要设上限：
-            4K 全量单次要 420 ms，配合节流会不断积压，拖滑块几十次就卡死
+        处理分辨率 = min(按显示尺寸算出的目标, 本档上限)：
+          · 播放中 · 调色    1280×720
+          · 播放中 · 不调色  3840×2160
+          · 暂停中 · 不调色  3840×2160
+          · 暂停中 · 调色    1920×1080（4K 全量单次调色 420 ms，拖滑块会积压）
+
+        ⚠️ 三条历史教训，都别再犯：
+          ① **上限不能只在调色时生效**（2.9.8）：不调色时 4K MOV 每帧按 3840×2160
+             全量处理 → 主线程压满 → 帧事件无界积压 →「越播越卡、最后程序退出」。
+          ② **缩放必须用平滑**（2.9.9）：最近邻降采样有锯齿、播放时还闪；
+             实测平滑只贵 ~1.6 ms（实测 5.6 vs 4.0 ms 量级），画质差别却很明显。
+          ③ **别固定成一个拍脑袋的分辨率**（2.9.9）：比屏幕大是浪费、比屏幕小是白糊；
+             按显示尺寸取，既不浪费也不糊。
+        `_raw` 一直保留全分辨率原帧，所以这里限的只是**处理分辨率**：
+        暂停 / 放大时会按需重渲出更清晰的图（见 on_playback_paused / _request_render）。
         """
         if self._raw is None:
             return
         src = self._raw
-        cap_w, cap_h = ((PLAY_MAX_W, PLAY_MAX_H) if self._is_playing()
-                        else (IDLE_MAX_W, IDLE_MAX_H))
-        if self._needs_color() and (src.width() > cap_w or src.height() > cap_h):
-            src = src.scaled(cap_w, cap_h, Qt.KeepAspectRatio, Qt.FastTransformation)
+        tw, th = self._target_size(src.width(), src.height())
+        if not self._is_playing():
+            if self._needs_color():
+                lim_w, lim_h = IDLE_MAX_W_COLOR, IDLE_MAX_H_COLOR
+            else:
+                lim_w, lim_h = IDLE_MAX_W, IDLE_MAX_H
+        elif self._needs_color():
+            lim_w, lim_h = PLAY_MAX_W, PLAY_MAX_H
+        else:
+            lim_w, lim_h = PLAY_MAX_W_PLAIN, PLAY_MAX_H_PLAIN
+        cap_w, cap_h = max(1, min(tw, lim_w)), max(1, min(th, lim_h))
+        if src.width() > cap_w or src.height() > cap_h:
+            src = src.scaled(cap_w, cap_h, Qt.KeepAspectRatio,
+                             Qt.SmoothTransformation)
         t0 = time.monotonic()
         img = _apply_color(src, self._bright, self._contrast, self._sat)
         self._pix = QPixmap.fromImage(img)
@@ -429,8 +485,76 @@ class VideoCanvas(ImageCanvas):
         if not self._has_frame:                    # 首帧：按窗口适应一次
             self._has_frame = True
             self.reset_fit()
+            # ⚠️ reset_fit() 已被重写成「顺手请求一次重渲」（窗口尺寸/缩放变化时要用），
+            #    但这里**刚按当前尺寸渲完** —— 不清掉就又排一轮，白做一次。
+            self._dirty = False
         else:
             self.update()                          # 后续帧只刷新画面，**保持**缩放 / 平移
+
+    def _frame_gap(self) -> float:
+        """两帧之间至少隔多久才值得处理 = max(基准间隔, 上帧整帧耗时 × 1.4)。
+
+        目的：处理一帧要 40 ms 时，把有效帧率自动降到 ~18fps —— 宁可掉帧，也绝不让
+        Qt 的帧事件在队列里越积越多（积压 = 越播越卡，最后内存涨爆 / 程序退出）。
+        ⚠️ 用的是**整帧**成本（`_frame_cost`，含 toImage / 缩放 / 调色 / QPixmap），
+        不是只有调色那段的 `_render_cost` —— 4K 的瓶颈主要在 `toImage()`。
+        """
+        base = FRAME_MIN_INTERVAL if self._needs_color() else FRAME_MIN_INTERVAL_PLAIN
+        return max(base, self._frame_cost * FRAME_COST_FACTOR)
+
+    def on_playback_paused(self) -> None:
+        """播放暂停 / 停止 / 结束 → 按「暂停档」重渲一次。
+
+        播放中的上限更保守（调色 1280×720）；停下来了就没必要再糊着 —— 按暂停档
+        重渲（`_raw` 一直是全分辨率原帧，只是把降采样那一步放宽）。
+        同时把 `_last_frame` 归零，让 `_is_playing()` 立刻变 False。
+        """
+        if self._raw is None:
+            return
+        self._last_frame = 0.0
+        self._render()
+
+    def _request_render(self) -> None:
+        """请求按**当前尺寸**重渲一次（暂停态才需要）。
+
+        处理分辨率是按显示尺寸算的（见 `_target_size`），所以窗口大小 / 缩放倍率一变，
+        就该按新尺寸重画一帧才够清晰。播放中不用管 —— 下一帧自然带上。
+        走既有的「周期 tick + 自适应间隔」节流，连点缩放也不会堆积。
+        """
+        if self._raw is None or self._is_playing():
+            return
+        self._dirty = True
+        self._ensure_tick()
+
+    def scale_to_source(self, s: float) -> float:
+        """把「相对当前处理图」的缩放换算成「相对原片」的缩放（信息条显示用）。
+
+        2.9.9 起处理分辨率按显示尺寸算，适应窗口时 `eff_scale()` 恒为 ~1.0 ——
+        直接显示会永远写「100%」，看不出实际是原片的多少（4K 片缩进窗口通常只有
+        20~40%）。这里按 `_raw` 的真实尺寸换算回来。
+        """
+        if self._raw is None or self._pix is None:
+            return s
+        if not self._raw.width() or not self._pix.width():
+            return s
+        return s * self._pix.width() / self._raw.width()
+
+    # ---- 窗口尺寸 / 缩放变化 → 暂停时按新尺寸重渲（播放中下一帧自然带上）----
+    def resizeEvent(self, e) -> None:
+        super().resizeEvent(e)
+        self._request_render()
+
+    def zoom_by(self, factor: float, pos=None) -> None:
+        super().zoom_by(factor, pos)
+        self._request_render()
+
+    def reset_fit(self) -> None:
+        super().reset_fit()
+        self._request_render()
+
+    def set_actual_size(self) -> None:
+        super().set_actual_size()
+        self._request_render()
 
     def _needs_color(self) -> bool:
         """有任一调节参数非 0（全 0 时不调色、也不做多余的降采样）。"""
@@ -452,6 +576,7 @@ class VideoCanvas(ImageCanvas):
         self._last_frame = 0.0
         self._last_render = 0.0
         self._render_cost = 0.0
+        self._frame_cost = 0.0
         self._zoom = 1.0
         self._fit = True
         self._off = QPointF(0, 0)
@@ -778,7 +903,7 @@ class MediaViewer(QDialog):
             self.slider_vol.valueChanged.connect(self._on_vol)
             self.player.positionChanged.connect(self._on_position)
             self.player.durationChanged.connect(self._on_duration)
-            self.player.playbackStateChanged.connect(lambda _s: self._sync_play_btn())
+            self.player.playbackStateChanged.connect(self._on_play_state)
             self.player.mediaStatusChanged.connect(self._on_status)
             self.player.errorOccurred.connect(self._on_error)
         else:                                        # pragma: no cover
@@ -1178,6 +1303,20 @@ class MediaViewer(QDialog):
         if self.player is not None:
             self.player.setPosition(self.slider.value())
 
+    def _on_play_state(self, st) -> None:
+        """播放状态变化：刷新播放按钮，并在**非播放**时让画布按暂停档重渲一次。
+
+        播放中画布把处理分辨率限到 960×540（流畅优先），停下来之后按 1920×1080
+        重渲，画面更清楚（`_raw` 一直是全分辨率原帧）。
+        """
+        self._sync_play_btn()
+        try:
+            _paused = (QMediaPlayer is not None and st != QMediaPlayer.PlayingState)
+        except Exception:                                # noqa: BLE001
+            _paused = False
+        if _paused and self.video is not None:
+            self.video.on_playback_paused()
+
     def _on_status(self, st) -> None:
         if st in (QMediaPlayer.MediaStatus.LoadedMedia,
                   QMediaPlayer.MediaStatus.BufferedMedia):
@@ -1193,6 +1332,10 @@ class MediaViewer(QDialog):
     def _on_scale(self, s: float) -> None:
         """缩放变化 → 刷新信息条（图片显示「尺寸·大小·百分比」，视频显示百分比）。"""
         path, _mid = self._items[self._index]
+        # 视频：百分比要按**原片**算 —— 画布是按显示尺寸处理的，`eff_scale()` 在
+        # 适应窗口时恒为 ~1.0，直接用它会永远显示「100%」（看不出是原片的多少）
+        if self.stack.currentIndex() != 0 and self.video is not None:
+            s = self.video.scale_to_source(s)
         pct = f"{max(1, round(s * 100))}%"
         if self.stack.currentIndex() == 0:
             pix = self.canvas._pix

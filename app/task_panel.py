@@ -299,6 +299,7 @@ class TaskCard(QFrame):
         super().__init__(parent)
         self.setObjectName("TaskCard")
         self.kind = kind if kind in KIND_META else ""
+        self.key = ""                           # 在 `_cards` 里的**当前**身份（会被换，见 _remove_clicked）
         self._state = "running"
         self.gname = ""                         # 所属群组名（状态栏显示用）
         self.gid = ""                           # 所属群组号
@@ -344,12 +345,16 @@ class TaskCard(QFrame):
         # 所以做成一直可见（低调灰色，悬停变红），一眼能看到。
         self.btn_remove = QToolButton()
         self.btn_remove.setText("✕")
-        self.btn_remove.setFixedSize(20, 20)
+        self.btn_remove.setFixedSize(24, 24)      # 点得中（20×20 偏小）
         self.btn_remove.setCursor(Qt.PointingHandCursor)
+        self.btn_remove.setToolTip("移除这张卡（只是不显示它，不影响下载）")
+        # ⚠️ 做成**明确的按钮外观**（浅底 + 边框 + 悬停红）：之前是淡灰小字，
+        #    既不像可点、又只有 20px —— 用户反馈「点了完全没反应」，可点性是嫌疑之一。
         self.btn_remove.setStyleSheet(
-            "QToolButton { color:#8b949e; background:transparent; border:none;"
-            " border-radius:4px; font-size:12px; }"
-            "QToolButton:hover { color:#cf222e; background:#ffebe9; }")
+            "QToolButton { color:#57606a; background:#f6f8fa;"
+            " border:1px solid #d0d7de; border-radius:6px; font-size:13px; }"
+            "QToolButton:hover { color:#ffffff; background:#cf222e;"
+            " border-color:#cf222e; }")
         self.btn_remove.clicked.connect(lambda *_: self.remove_requested.emit())
         head.addWidget(self.btn_remove)
         lay.addLayout(head)
@@ -521,13 +526,19 @@ class TaskPanel(QWidget):
     """
 
     stop_all_requested = Signal()
+    # 某张卡片被用户移除（✕ / 右键菜单）→ 主窗口记一行日志：
+    # 既让用户**看得见点击生效了**，也是「点击到底有没有到达」的判据。
+    card_removed = Signal(str)
 
-    # 卡片总数上限（含进行中）。
-    # ⚠️ 这个值不能小：tdl 边下边完成时，若上限只有 2，卡片会被实时删到只剩 2 张，
-    # 表现就是「明明 4 并发，页面只显示 2 个任务」，而且旧卡被删后新完成的补位，
-    # 看起来像「同一张卡的内容在不同任务间来回切换」。
-    MAX_CARDS = 20
-    MAX_FINISHED_CARDS = 20        # 已完成卡片的保留上限（与总数上限分开控制）
+    # 卡片总数上限（含进行中）—— 用户要求「任务进度的卡片渲染缩减至 10 个」（2.9.7）。
+    # ⚠️ **进行中的卡片永不修剪**（见 _prune_finished，它只挑 state != "running" 的）：
+    #    压掉的是历史遗留的**完成卡**，绝不能把正在跑的任务从界面上抹掉。
+    #    因此并发数超过这个上限时，实际卡片数会**多于 10** —— 这是有意的。
+    # ⚠️ 值也不能过小：tdl 边下边完成时，上限太小会让卡片被实时删到只剩几张，
+    #    表现就是「明明 4 并发，页面只显示 2 个任务」，旧卡被删后新完成的补位还会
+    #    看起来像「同一张卡的内容在不同任务间来回切换」。
+    MAX_CARDS = 10
+    MAX_FINISHED_CARDS = 10        # 已完成卡片的保留上限（与总数上限分开控制）
     # 进行中的卡片连续这么久没有任何进度行认领 → 视为已中断（见 _finalize_stale）
     STALE_SECONDS = 60.0
 
@@ -587,6 +598,11 @@ class TaskPanel(QWidget):
         self._status = ""                          # 运行状态前缀（就绪/进行中/完成…）
         self._running_count = 0                    # 进行中卡片数（增量维护，避免每次全遍历）
         self._pruned_keys: set[str] = set()        # 已修剪任务：忽略 tdl 后续重绘（防复活）
+        # ⭐ 用户**手动删掉**的卡片身份（✕ 按钮 / 右键「移除这张卡」）。tdl 每轮还会把
+        #    这个任务当活跃任务重画，`_touch_card` 找不到卡就会**就地新建** —— 必须
+        #    靠这个集合压制，卡才是「真的删掉」而不是「删了又回来」。本轮命令结束
+        #    （`begin()`）才清空。
+        self._removed_keys: set[str] = set()
         self._unseen: dict[str, float] = {}         # 进行中卡片「本轮没被认领」的起始时刻
 
         # ---- 轮次级任务追踪（详见 push_row / commit_round 的说明）----
@@ -602,6 +618,9 @@ class TaskPanel(QWidget):
         self._dl_dir = ""                          # 下载目录（.tmp 锚定 / 已下载号排除用）
         self._restart = False                      # --restart：tdl 重下全部（不做已存在排除）
         self._done_mids: set[str] = set()          # 磁盘上「已下载完成」的消息号（每轮刷新）
+        # 本次运行累计进度回调 `fn(total_bytes, task_count)` —— 下载统计据此
+        # **按实际发生的时间**分账（见 stats.add_progress）；None 时不做任何事。
+        self._progress_hook = None          # 磁盘上「已下载完成」的消息号（每轮刷新）
 
     # ------------------------------------------------------------------
     def set_status(self, text: str) -> None:
@@ -621,6 +640,7 @@ class TaskPanel(QWidget):
         self._ok = None
         self._running_count = 0
         self._pruned_keys.clear()
+        self._removed_keys.clear()
         self._unseen.clear()
         self._live.clear()
         self._round_active.clear()
@@ -820,20 +840,32 @@ class TaskPanel(QWidget):
                 # 重写 live：否则旧身份那张卡会留在 _cards 里，变成永远「进行中」
                 # 的僵尸卡 —— 实测表现就是序号「提前一位」且混进了已下载过的号
                 # （第一轮 tmp 还没落盘时按池序建了卡，后续锚定又另外建了新卡）。
-                moved = [self._cards.pop(k, None) for k in old_keys]
+                # ⚠️ 只搬**公共前缀**（min 长度）：两边长度不等时（本轮多了一个任务 /
+                #    完成行没定位到）也绝不能整列错位 —— 多出来的新键靠 `_touch_card`
+                #    新建，多出来的旧键其卡片已不属于活跃集，交给 `_finalize_stale` 定格。
+                nn = min(len(old_keys), len(new_keys))
+                moved = [self._cards.pop(k, None) for k in old_keys[:nn]]
                 for k in new_keys:
-                    self._cards.pop(k, None)          # 清掉可能残留的同名卡
+                    # ⚠️ 必须**连控件一起收掉**：只摘字典项的话，控件还挂在布局里，
+                    #    就成了 `_cards` 里不存在的**幽灵卡** —— 点 ✕ 无反应、
+                    #    `_prune_finished` 与「清空已完成」都遍历不到它，永远删不掉
+                    #    （用户实测「任务卡依然无法删除」的成因之一）。
+                    self._drop_card_widget(self._cards.pop(k, None))
                 for k in old_keys:                    # 旧键的统计一并清掉（下轮重建）
+                    if k in self._removed_keys:
+                        continue                      # 用户删掉的卡：保留其已下载量（属事实）
                     self._bytes_by_key.pop(k, None)
                     self._rate_by_key.pop(k, None)
                     self._pruned_keys.discard(k)
                 live[:] = [[k, 0] for k in new_keys]
                 for i, k in enumerate(new_keys):
                     self._mid_used.add(disk_mids[i])
-                    self._pruned_keys.discard(k)
-                    card = moved[i] if i < len(moved) else None
+                    if k not in self._removed_keys:
+                        self._pruned_keys.discard(k)
+                    card = moved[i] if i < nn else None
                     if card is not None:
                         self._cards[k] = card
+                        card.key = k        # ⚠️ 身份变了 → 回调要按新身份删（见 _remove_clicked）
                         card.retitle(gid, disk_mids[i], self._file_of(disk_mids[i]))
                 for i, a in enumerate(active):
                     self._touch_card(live[i][0], a)
@@ -893,7 +925,11 @@ class TaskPanel(QWidget):
         self._finalize_stale(claimed)
         # _prune_finished 只动「已完成」的卡片，对进行中的无影响，无条件调用是安全的。
         self._prune_finished()
+        # 兜底：不在 `_cards` 里的卡片控件一律收掉（漏过一次就会留点不掉的幽灵卡）
+        self._sweep_orphan_widgets()
         self._reorder_cards()
+        # 上报本次运行累计进度 → 下载统计按**实际发生的时间**分账（跨零点分记两天）
+        self._emit_progress()
 
     def _reorder_cards(self) -> None:
         """按消息 id 升序排列卡片（id 拿不到的排在最后）。
@@ -930,6 +966,8 @@ class TaskPanel(QWidget):
         mid = self._pick_full_id(info.get("mid"))
         if gid and mid:
             k = f"{gid}:{mid}"
+            if k in self._removed_keys:
+                return k          # 用户删过：沿用真实身份（`_touch_card` 不会再建卡）
             if k not in self._cards and k not in self._pruned_keys:
                 return k
         self._uid += 1
@@ -966,6 +1004,13 @@ class TaskPanel(QWidget):
                     if v <= db and v > best_v:
                         best, best_v = i, v
                 return best if best is not None else cands[0]
+        # ⚠️ 完成行指的是「用户已经删掉的那张卡」时**直接丢弃**：这张卡可能已经不
+        #    在 live 里了（它的 .tmp 被改名 → 本轮磁盘锚定重建 live 时就没有它），
+        #    再往下走字节兜底会把这次完成**认领到别的卡上**（把无关的卡标成已完成）。
+        if gid and mid:
+            if any(k.partition(":")[0] == gid and k.partition(":")[2].startswith(mid)
+                   for k in self._removed_keys):
+                return None
         db = d.get("bytes") or 0
         best, best_v = None, -1
         for i, x in enumerate(live):
@@ -975,8 +1020,18 @@ class TaskPanel(QWidget):
         return best
 
     def _touch_card(self, key: str, info: dict) -> None:
-        """按身份更新（不存在则新建）卡片。"""
+        """按身份更新（不存在则新建）卡片。
+
+        ⚠️ 用户手动删掉的卡（`_removed_keys`）**绝不重建** —— tdl 下一秒还会把这个
+        任务当活跃任务重画，重建就等于「删不掉」。
+        """
         card = self._cards.get(key)
+        if card is None and key in self._removed_keys:
+            # 卡不建，但已下载量仍要计入统计（已下完的数据是事实）
+            if info.get("bytes") is not None:
+                self._bytes_by_key[key] = int(info["bytes"])
+                self._refresh_summary()
+            return
         if card is None:
             self._seq += 1
             # 详情行：只显示「群号:消息号」（与 tdl 终端输出对应），不显示群名
@@ -985,7 +1040,12 @@ class TaskPanel(QWidget):
             card.setToolTip(f"群名：{info.get('gname') or '—'}\n"
                             f"tdl 原始输出：{info.get('raw') or '—'}")
             self._cards[key] = card
-            card.remove_requested.connect(lambda _=False, k=key: self.remove_card(k))
+            card.key = key
+            # ⚠️ 回调**不要**把 key 闭包进来：卡片会被磁盘锚定换身份（见 commit_round ⓪），
+            #    闭包里的旧 key 那时已不在 `_cards` 里 → 点 ✕ 静默无效；旧 key 若被别的卡
+            #    接手，还会**删错卡**（用户实测「任务卡依然无法删除」的主因）。
+            #    改成点击时按卡片**当前**身份解析（_remove_clicked）。
+            card.remove_requested.connect(lambda _=False, c=card: self._remove_clicked(c))
             self._cards_lay.insertWidget(self._cards_lay.count() - 1, card)
             if card.state == "running":
                 self._running_count += 1
@@ -1079,6 +1139,63 @@ class TaskPanel(QWidget):
             self._pruned_keys.add(key)
             self._rate_by_key.pop(key, None)     # 卡片没了就别再往网速里加
 
+    def _remove_clicked(self, card) -> None:
+        """✕ / 右键「移除这张卡」的**唯一入口**：按卡片**当前**身份删。
+
+        卡片对象会在磁盘 `.tmp` 锚定时被搬到新身份上（`_cards[new_keys[i]] = moved[i]`），
+        所以「建卡时闭包进来的 key」和「此刻 `_cards` 里的 key」可能已经不是同一个 ——
+        拿旧 key 调 `remove_card` 会静默失败，甚至删到接手了那个 key 的另一张卡。
+        这里改成点击时反查：
+          · 先用卡片自己记的 `key`（O(1)）；
+          · 对不上就按**对象**反查 `_cards`（键上限 20，代价可忽略）；
+          · 都不在（卡片已被清掉）→ 至少把控件收掉，别在界面上留删不掉的幽灵卡。
+        """
+        key = getattr(card, "key", "")
+        if key and self._cards.get(key) is card:
+            self.remove_card(key)
+            return
+        for k, c in self._cards.items():
+            if c is card:
+                self.remove_card(k)
+                return
+        self._drop_card_widget(card)
+
+    def _drop_card_widget(self, card) -> None:
+        """把一张卡片控件从界面上彻底收掉（连同 `_running_count` / 网速的账）。
+
+        与 `remove_card` 的区别：**不记 `_removed_keys`** —— 它只表示「这个控件不再需要」，
+        不代表用户要求压住这个任务（例如磁盘锚定把同名键的重复卡收掉）。
+        """
+        if card is None:
+            return
+        if card.state == "running":
+            self._running_count = max(0, self._running_count - 1)
+        self._rate_by_key.pop(getattr(card, "key", ""), None)
+        card.setParent(None)
+        card.deleteLater()
+
+    def _card_widgets(self) -> list:
+        """布局里当前实际存在的卡片控件（跳过尾部 stretch 这类非控件项）。"""
+        lay = self._cards_lay
+        return [w for w in (lay.itemAt(i).widget() for i in range(lay.count()))
+                if w is not None]
+
+    def _sweep_orphan_widgets(self) -> int:
+        """兜底清扫：把布局里**不属于 `_cards`** 的卡片控件收掉，返回收掉的数量。
+
+        为什么要有：卡片控件一旦与 `_cards` 脱钩，就成了点 ✕ 无反应、
+        `_prune_finished` 与「清空已完成」都遍历不到的**幽灵卡** —— 用户只能重启程序
+        （实测反馈「任务卡依然无法删除」的成因之一）。
+        正常生命周期里不该出现这种控件，所以这一扫与具体成因无关，纯兜底。
+        """
+        known = {id(c) for c in self._cards.values()}
+        n = 0
+        for w in self._card_widgets():
+            if id(w) not in known:
+                self._drop_card_widget(w)
+                n += 1
+        return n
+
     def remove_card(self, key: str) -> bool:
         """移除**任意一张**卡片（右键菜单入口），进行中的也能删。
 
@@ -1098,14 +1215,18 @@ class TaskPanel(QWidget):
             self._running_count = max(0, self._running_count - 1)
         card.setParent(None)
         card.deleteLater()
+        # ⚠️⚠️ 记入 `_removed_keys` 是「真的删掉」的关键：tdl 下一轮**还会把这个任务
+        #     当活跃任务重画**，而 `_touch_card` 在 _cards 里找不到 key 时会**就地新建
+        #     一张卡** → 卡立刻复活（用户实测「任务卡依然无法删除」）。
+        self._removed_keys.add(key)
         self._pruned_keys.add(key)
-        # ⚠️ 必须同时从 `_live`（活跃身份列表）里摘掉：下一轮的「按位置对齐」是直接
-        #    用 live[i] 的身份去 _touch_card 的，留着它卡片会被原地复活
-        #    （实测：移除后再来一轮进度行，卡片又回来了）
-        self._live[:] = [x for x in self._live if x[0] != key]
+        # ⚠️ **不要**把这个 key 从 `_live` 摘掉！磁盘锚定是按**位置**搬移卡片的，
+        #     少一个旧键会让**后面所有卡整体错位**（实测把别的卡也改成错的序号）。
+        #     保留占位 → 位置一一对应 → 只是这张卡不再重建。
         self._rate_by_key.pop(key, None)
         self._unseen.pop(key, None)
         self._refresh_summary()
+        self.card_removed.emit(key)          # 让「移除生效」看得见（见信号定义）
         return True
 
     def _finalize_stale(self, claimed) -> None:
@@ -1127,21 +1248,34 @@ class TaskPanel(QWidget):
         claimed = set(claimed)
         now = time.monotonic()
         changed = False
-        for key, card in list(self._cards.items()):
+        # 遍历「有卡片的」+「只在 _live 里占位的」（后者=用户删掉的卡，见 remove_card）
+        keys = list(dict.fromkeys(list(self._cards) + [x[0] for x in self._live]))
+        for key in keys:
+            card = self._cards.get(key)
             if key in claimed:                   # 本轮有进度行认领 → 还活着
                 self._unseen.pop(key, None)
                 continue
-            if card.state != "running":
+            if card is not None and card.state != "running":
                 self._unseen.pop(key, None)
                 continue
             t0 = self._unseen.setdefault(key, now)
             if now - t0 < self.STALE_SECONDS:
                 continue
+            self._unseen.pop(key, None)
+            if card is None:
+                # 用户删掉、且 tdl 已不再报告它 → 撤掉 _live 占位（不必再参与位置对齐）
+                # ⚠️ 但**绝不取消压制**：长下载里 Telegram 限速暂停、某一轮没报这个
+                #    任务，很容易出现这种「没被认领」的空档；一旦在此把 key 从
+                #    `_removed_keys` 移除，那张卡就又能被重建，用户看到的就是
+                #    「删了过一会儿又冒出来」（实测反馈第二次）。压制的生命周期
+                #    只有 `begin()` 能结束。
+                self._live[:] = [x for x in self._live if x[0] != key]
+                changed = True
+                continue
             card.set_state("stopped")            # 已终止（不再是进行中 → 可修剪/可清空）
             card.set_compact()
             self._running_count = max(0, self._running_count - 1)
             self._rate_by_key.pop(key, None)
-            self._unseen.pop(key, None)
             changed = True
         if changed:
             self._prune_finished()
@@ -1158,6 +1292,29 @@ class TaskPanel(QWidget):
                 self._rate_by_key.pop(key, None)
                 self._unseen.pop(key, None)
         self._refresh_summary()
+
+    def set_progress_hook(self, fn) -> None:
+        """登记「本次运行累计进度」回调，签名 `fn(total_bytes, task_count)`。
+
+        total_bytes = 本次运行所有任务卡已下载字节之和（累计值，非增量）；
+        task_count = 其中已经有数据的任务（文件）数。
+        每次刷新（`commit_round` 末尾）调用一次；**回调抛错绝不影响下载界面**。
+        """
+        self._progress_hook = fn
+
+    def progress_snapshot(self) -> tuple[int, int]:
+        """本次运行的累计进度：`(已下载字节之和, 已有数据的任务数)`。"""
+        vals = [v for v in self._bytes_by_key.values() if v]
+        return sum(vals), len(vals)
+
+    def _emit_progress(self) -> None:
+        fn = self._progress_hook
+        if fn is None:
+            return
+        try:
+            fn(*self.progress_snapshot())
+        except Exception:                        # noqa: BLE001 - 统计失败不能影响下载
+            pass
 
     def _refresh_summary(self) -> None:
         n = len(self._cards)
@@ -1249,6 +1406,7 @@ class TaskBox(QWidget):
 
         self.table = TaskPanel()
         self.table.stop_all_requested.connect(self.stop_all_requested.emit)
+        self.table.card_removed.connect(self.card_removed.emit)
         self.table.setMinimumHeight(320)
         lay.addWidget(self.table, 1)
 
@@ -1290,6 +1448,16 @@ class TaskBox(QWidget):
 
     def finish(self, ok: bool) -> dict:
         return self.table.finish(ok)
+
+    card_removed = Signal(str)
+
+    def set_progress_hook(self, fn) -> None:
+        """透传累计进度回调（下载统计按实际时间分账用，见 TaskPanel.set_progress_hook）。"""
+        self.table.set_progress_hook(fn)
+
+    def progress_snapshot(self) -> tuple[int, int]:
+        """透传本次运行累计进度快照。"""
+        return self.table.progress_snapshot()
 
     def total_bytes_text(self) -> str:
         return self.table.total_bytes_text()

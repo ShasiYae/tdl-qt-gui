@@ -5,6 +5,9 @@
 用法：python shot.py [输出目录]
 """
 from __future__ import annotations
+import _tguard as _G          # 统一超时护栏（超时自爆退出，见 _tguard.py）
+_G.arm(60)                    # 本脚本规定 60 秒，到点自爆、不留挂死的进程
+
 
 import os
 import sys

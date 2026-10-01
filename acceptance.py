@@ -3,6 +3,9 @@
 验收测试：用 GUI 的 argv 拼装逻辑，下载指定群前 100 条消息的全部附件。
 """
 from __future__ import annotations
+import _tguard as _G          # 统一超时护栏（超时自爆退出，见 _tguard.py）
+_G.arm(120)                    # 本脚本规定 120 秒，到点自爆、不留挂死的进程
+
 
 import os
 import sys

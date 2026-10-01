@@ -185,11 +185,12 @@ COMMANDS: list[dict] = [
             # ---------- 常驻组：任何子选项卡下都可见 ----------
             dict(title="下载来源",
                  switchable=dict(
-                     key="srcMode", default="url",
+                     key="srcMode", default="json",
+                     # 选项顺序 = 用户指定的优先级：JSON 文件下载 → 导出 JSON → 链接下载
                      options=[
-                         dict(v="url", l="链接下载", hint="粘贴 Telegram 消息链接"),
                          dict(v="json", l="JSON 文件下载", hint="用官方客户端导出的聊天记录"),
                          dict(v="export", l="导出 JSON", hint="先把我群导出成 json，不下载文件"),
+                         dict(v="url", l="链接下载", hint="粘贴 Telegram 消息链接"),
                      ],
                  ),
                  fields=[

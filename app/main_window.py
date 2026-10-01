@@ -735,6 +735,11 @@ class MainWindow(QMainWindow):
         self.content.action_bar.run_clicked.connect(self.run_current)
         self.content.action_bar.cancel_clicked.connect(self._cancel_current)
         self.task_box.stop_all_requested.connect(self._cancel_current)
+        # 卡片被移除时在运行输出留一行 —— 用户点完能立刻看到生效，我们也据此判断
+        # 「点击有没有到达」（若点了没这行，说明点击根本没到按钮）
+        self.task_box.card_removed.connect(self._on_card_removed)
+        # 下载统计：面板每次刷新都上报累计进度 → 按**实际发生的时间**分账
+        self.task_box.set_progress_hook(self._on_dl_progress)
         self.content.action_bar.reset_clicked.connect(self._reset_current)
 
         # 同步命名空间显示（默认值来自 data.py）
@@ -2082,11 +2087,14 @@ class MainWindow(QMainWindow):
         self.content.form_layout.addWidget(gb)
 
         note = QLabel(
-            "统计口径：仅统计成功执行的下载任务（导出 JSON / 上传 / 转发不计入）。\n"
+            "统计口径：仅统计下载任务（导出 JSON / 上传 / 转发不计入）；"
+            "命令中途失败但已下到的部分也会计入。\n"
             "任务数 = 已下载的任务（文件）数；"
-            "下载量 = 各文件最新已完成字节之和；下载时长 = 命令墙钟耗时；"
+            "下载量 = 各文件最新已完成字节之和；"
+            "下载时长 = 实际在下载的时长（跨零点按天分开计）；"
             "平均速度 = 下载量 ÷ 下载时长。\n"
-            "数据保存在软件目录 resources/stats.json，每个自然日一个统计周期。"
+            "数据保存在软件目录 resources/stats.json；统计按「实际发生的时间」分账，"
+            "跨零点的下载会分别记到两天。"
         )
         note.setWordWrap(True)
         note.setStyleSheet(f"color:{T.TEXT_DIM}; font-size:12px; background:transparent;")
@@ -2321,6 +2329,8 @@ class MainWindow(QMainWindow):
     def _on_started(self, argv: list) -> None:
         self._out_errors = 0                     # 新命令：异常计数归零
         self._tdl_notes_seen.clear()             # 新命令：tdl 提示可以再提示一次
+        if self._run_kind == "dl":
+            stats.begin_run()                    # 下载统计：复位增量基准（按实际时间分账）
         self._load_id_pool(argv)                 # 有下载源 JSON 时登记完整消息号
 
     def _load_id_pool(self, argv: list) -> None:
@@ -2405,6 +2415,20 @@ class MainWindow(QMainWindow):
             return
         self.content.log.out(strip_ansi(line))   # 剥掉重绘控制符再进日志
 
+    def _on_card_removed(self, key: str) -> None:
+        """用户移除了一张任务卡 → 运行输出留痕（只是不显示它，下载不受影响）。"""
+        self.content.log.out(f"[任务] 已移除卡片 {key}")
+
+    def _on_dl_progress(self, total_bytes: int, task_count: int) -> None:
+        """任务面板刷新回调 → 下载统计按**实际发生的时间**累加增量。
+
+        面板每刷新一轮调一次，把「本次运行累计值」交给 stats，由它比对上次求出
+        增量并记到**当下**那一天 —— 跨零点的下载因此天然分成两天
+        （用户要求「按实际时间划分」）。
+        """
+        if self._run_kind == "dl":
+            stats.add_progress(total_bytes, task_count)
+
     def _on_err(self, line: str) -> None:
         self.content.log.err(strip_ansi(line))
 
@@ -2423,9 +2447,15 @@ class MainWindow(QMainWindow):
             return
         # 下载统计：只要本次确实下到了数据就记账（哪怕命令整体返回失败，
         # 部分成功的文件也应计入），任务数按已下载的文件数计。
-        if self._run_kind == "dl" and agg.get("bytes"):
-            stats.add_download(int(agg["bytes"]), float(rec.duration),
-                               int(agg.get("count", 1)))
+        # 下载统计：进度推进过程中已按**实际发生的时间**逐次累加
+        # （_on_dl_progress → stats.add_progress），这里只做收尾
+        # （补最后一次增量）并强制落盘。
+        if self._run_kind == "dl":
+            try:
+                stats.add_progress(*self.task_box.progress_snapshot())
+                stats.flush()
+            except Exception:                    # noqa: BLE001 - 统计绝不能影响收尾
+                pass
         # 失败/中断时也保留实际下载量，不再强制归零（旧逻辑会把已下载的量抹掉）
         self.statusbar.set_val("dl", fmt_bytes_dec(agg.get("bytes", 0)))
         self.statusbar.set_val("speed", "0 B/s")
