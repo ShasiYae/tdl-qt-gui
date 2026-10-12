@@ -30,26 +30,12 @@ RES_DIR = "resources"
 JSON_DIR = "json"     # 下载 json 存放处
 DL_DIR = "dl"         # 下载根目录
 
-# 拼音首字母常用字表（与 HTML 原型 PINYIN_INITIAL 一致，可按需扩充）
-PINYIN_INITIAL = {
-    "张": "z", "三": "s", "李": "l", "四": "s",
-    "科": "k", "技": "j", "资": "z", "讯": "x", "频": "p", "道": "d",
-    "摸": "m", "鱼": "y", "群": "q",
-    "源": "y", "分": "f", "享": "x", "站": "z",
-    "开": "k", "发": "f", "者": "z", "交": "j", "流": "l",
-    "涂": "t", "狗": "g",
-    "大": "d", "小": "x", "中": "z", "国": "g", "网": "w", "友": "y",
-    "影": "y", "视": "s", "音": "y", "乐": "l", "游": "y", "戏": "x",
-    "学": "x", "习": "x", "工": "g", "作": "z", "生": "s", "活": "h",
-    "新": "x", "闻": "w", "财": "c", "经": "j", "股": "g", "票": "p",
-    "房": "f", "地": "d", "产": "c", "汽": "q", "车": "c", "数": "s", "码": "m",
-    # 常见群名高频字补充
-    "软": "r", "件": "j", "讨": "t", "论": "l", "电": "d", "子": "z",
-    "书": "s", "库": "k", "小": "x", "说": "s", "日": "r", "常": "c",
-    "免": "m", "费": "f", "资": "z", "源": "y", "分": "f", "享": "x",
-    "正": "z", "能": "n", "量": "l", "精": "j", "神": "s", "妹": "m",
-    "混": "h", "乱": "l", "的": "d", "生": "s", "活": "h",
-}
+# 拼音首字母**全表**（20892 个常用汉字，由 pypinyin 离线生成，见 `pinyin_data.py`）
+#
+# ⚠️ 这里以前是一张 **77 个字的手写小表**，查不到的字会被**原样留在文件名里** ——
+#    于是「男大之梦」的锚定名成了 `男d之梦`、「漫画之家关联」整个没转换。
+#    v2.10.3 换成全表，运行时不需要 pypinyin（数据是固化的静态表）。
+from .pinyin_data import PINYIN_LETTER
 
 
 def app_root() -> Path:
@@ -57,6 +43,23 @@ def app_root() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent.parent
+
+
+# ---- 内置下载引擎（自编译的 tdl）----
+# 用户约定（2026-10-11）：GUI 用**自己编译的那份 tdl**，放在软件目录下的 `bin\`。
+# 放 bin\ 而不是根目录，是为了跟官方「绿色便携」的 app_root\tdl.exe 分开，
+# 免得被「一键部署」覆盖（见 envcheck.resolve_tdl_path 的优先级）。
+ENGINE_DIR_NAME = "bin"
+
+
+def engine_dir() -> Path:
+    """内置引擎目录 = 软件目录下的 bin\。"""
+    return app_root() / ENGINE_DIR_NAME
+
+
+def engine_exe() -> Path:
+    """内置引擎的可执行文件路径（不保证存在）。"""
+    return engine_dir() / ("tdl.exe" if os.name == "nt" else "tdl")
 
 
 def res_root() -> Path:
@@ -86,11 +89,16 @@ def dl_root_str() -> str:
 
 # ============================================================ 命名规则
 def pinyin_initials(name: str) -> str:
-    """取名称的拼音首字母（中文取声母，英文/数字原样小写，去掉空格与符号）。"""
+    """取名称的拼音首字母：中文取每个字的拼音首字母，英文/数字原样小写。
+
+    ⚠️ 中文**一律转成字母**。查不到的字（生僻字 / 基本汉字区之外）直接**跳过** ——
+    不再像以前那样把汉字原样塞进文件名（`男大之梦` → `男d之梦`），
+    那样得到的锚定名既不是首字母、又会让路径里混进中文。
+    """
     out = ""
     for ch in str(name or ""):
-        if re.match(r"[\u4e00-\u9fa5]", ch):
-            out += PINYIN_INITIAL.get(ch, ch)
+        if "\u4e00" <= ch <= "\u9fa5":
+            out += PINYIN_LETTER.get(ch, "")
         elif re.match(r"[A-Za-z0-9]", ch):
             out += ch.lower()
         # 其余字符（空格、标点、emoji）直接丢弃
@@ -233,17 +241,52 @@ def merge_export_json(target, incoming) -> tuple[int, int]:
 
 # ============================================================ 会话匹配
 def find_chat(chats: list[dict], key: str) -> dict | None:
-    """在 chat ls -o json 的结果里查会话（id 精确 / username / 归一化群号）。"""
+    """在 chat ls -o json 的结果里查会话。
+
+    用户实际会填的形态都要认：
+      · `@username` / `username`
+      · 纯群号 `2305571652` —— 实测 tdl 给的 id 就是这个形态
+        （`resources/json/<缩写>-<群号>.json` 里 `{"id":2305571652}`），
+        用户多半也是从这类文件名里抄的
+      · `-1002305571652` / `-2305571652` —— 私有超级群的另一种写法，
+        tdl 有些路径会这么给（本文件 `chat_no()` 即为此而写）
+      · 群名（精确匹配，用户图省事直接贴群名时）
+    """
     key = str(key or "").strip().lstrip("@")
     if not key:
         return None
-    nkey = chat_no_key(key)
+
+    # ① 原样比：id / username
     for c in chats:
         if str(c.get("id", "")) == key or str(c.get("username", "")).lstrip("@") == key:
             return c
+    # ② 群名精确匹配（用户图省事直接贴群名的情况）
     for c in chats:
-        if chat_no_key(c.get("id")) == nkey and nkey:
+        name = c.get("visible_name") or c.get("title") or c.get("name") or ""
+        if str(name).strip() == key:
             return c
+    # ③ 群号宽松匹配 —— 把 id 归一化成「所有可能的纯群号」再取交集。
+    #    为什么是集合：tdl 给的形态不止一种 ——
+    #    实测 `chat ls` / 导出 json 里是**纯数字** `2305571652`，
+    #    但私有超级群也可能是 `-1002305571652`（本文件 `chat_no()` 就是为后者写的）。
+    #    而用户从**导出文件名**里抄到的永远是纯数字那一种。两边都归一化才不会有漏。
+    def _nums(v) -> set:
+        s = str(v or "").strip()
+        out = set()
+        d = re.sub(r"\D", "", s)
+        if d:
+            out.add(d)
+        for pat in (r"^-100(\d+)$", r"^-(\d+)$"):
+            m = re.match(pat, s)
+            if m:
+                out.add(m.group(1))
+        return out
+
+    kn = _nums(key)
+    if kn:
+        for c in chats:
+            if kn & _nums(c.get("id")):
+                return c
     return None
 
 

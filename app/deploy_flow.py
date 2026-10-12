@@ -31,8 +31,10 @@ SECTIONS = [
 表现是一直转圈。三个选项：直连 GitHub（海外/全局代理）、加速镜像（经 gh-proxy.com 中转，最省事）、
 勾选「下载走代理」（有稳定本地代理时最可靠）。</p>
 <p style="color:#8a6100;background:#fff8e1;padding:8px;">
-部署位置固定为<b>本软件所在目录</b>（绿色便携）—— tdl.exe / ffmpeg.exe 与 main.py 并排，
-整个文件夹可直接拷到别的机器用。
+部署位置：<b>tdl 装到本软件目录下的 <code>bin</code> 子目录</b>（软件自带的下载引擎，
+与官方「绿色便携」放在软件根目录的 <code>tdl.exe</code> 分开存放，免得互相覆盖）；
+<b>ffmpeg / 环境变量仍按软件目录</b>；<b>用户 PATH 会写入 tdl 所在的 <code>bin</code></b>
+（这样在终端里直接敲 <code>tdl</code> 就能用）。整个文件夹可直接拷到别的机器用。
 </p>
 """,
     ),
@@ -136,7 +138,7 @@ tdl extension upgrade &lt;名称&gt;              <span style="color:#6b7280;">#
 <b>不依赖这个文件</b>）：</p>
 <div style="background:#f6f8fa;padding:10px;font-family:Consolas,monospace;">
 <pre style="margin:0;">{
-  "tdl_exe":     "&lt;软件目录&gt;\\\\tdl.exe",
+  "tdl_exe":     "&lt;软件目录&gt;\\\\bin\\\\tdl.exe",
   "tdl_version": "0.20.4",
   "ffmpeg_exe":  "&lt;软件目录&gt;\\\\ffmpeg.exe",
   "env":         { "TDL_PROXY": "http://127.0.0.1:7890", "TDL_THREADS": "8", ... },

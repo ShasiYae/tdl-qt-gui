@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from . import paths
 from .media_tools import ffmpeg_path, ffprobe_path           # noqa: F401（对外仍可用）
-from .media_viewer import HAVE_QTMM, is_viewable, open_media
+from .media_viewer import HAVE_QTMM, _qt_alive, is_viewable, open_media
 from .msg_cache import SlimError, load_messages
 from .msg_dedup import dedup_keep_ends
 from .task_panel import fmt_bytes_dec
@@ -548,7 +548,10 @@ class MsgBrowser(QWidget):
         self._slim_info: dict = {}              # 精简缓存信息 {from_cache, removed, slim}
         self._pending_highlight = ""            # 待定位的消息编号（翻页完成后高亮）
         self._open_list: list[tuple[Path, str]] = []   # (路径, 消息编号)：查看器切换 + 跳回消息
-        self._viewers: list[QDialog] = []       # 已打开的内置查看器（非模态，需持引用）
+        # ⚠️ **单实例**（10-11 改）：只留一个查看器实例，关闭时**只隐藏不销毁**，
+        #    下次打开直接复用 —— 反复「关掉再开」不再重建 WMF 解码后端。
+        #    真正销毁走 `_destroy_viewer()`（release_memory / unload 时）。
+        self._viewer: QDialog | None = None
         self._gi = 0                            # 已插入的分组游标
         self._rendering = False
         self._released = False                  # 内容是否已被「切后台」卸载（见 release_memory）
@@ -721,13 +724,7 @@ class MsgBrowser(QWidget):
         name = Path(self._path).name if self._path else ""
         n = len(self._all) + len(self._index) + len(self._by_name)
         self.teardown()                          # 停表 + 清队列/分组 + 销毁卡片
-        for v in list(self._viewers):
-            try:
-                v.close()
-                v.deleteLater()
-            except (RuntimeError, AttributeError):
-                pass
-        self._viewers = []
+        self._destroy_viewer()
         self._all = []
         self._chat_id = ""
         self._path = ""
@@ -767,6 +764,12 @@ class MsgBrowser(QWidget):
         self.teardown()                     # 切文件 → 旧卡片 / 旧加载队列全部结束
         self._released = False              # 主动加载 = 内容重新建立（清掉「已卸载」标记，
                                             # 否则切后台再回来会多走一次恢复）
+        # 崩溃日志上下文：先记下「正在加载哪一份」，连加载中途崩都能对上号
+        try:
+            from . import crashlog
+            crashlog.set_context("msg_json", Path(path).name)
+        except Exception:                                 # noqa: BLE001
+            pass
         try:
             msgs, cid, info = load_messages(path)
         except SlimError as e:
@@ -789,6 +792,14 @@ class MsgBrowser(QWidget):
         # 缓存命中，或首次已把重复合并掉 → 视图内不再重复去重（省一次近似聚类）
         self._pre_slimmed = bool(info.get("removed")) or bool(info.get("from_cache"))
         self._index_files()
+        # 崩溃日志上下文（内存水位行会带上）：崩的时候能一眼看出崩在哪份数据、
+        # 当时有多少条消息、索引了多少个本地文件
+        try:
+            from . import crashlog
+            crashlog.set_context("msgs", len(msgs))
+            crashlog.set_context("media_idx", len(self._index))
+        except Exception:                                 # noqa: BLE001
+            pass
         self.rebuild()
         self._sync_unload_btn()
         return True
@@ -921,24 +932,18 @@ class MsgBrowser(QWidget):
           · `_all` —— 整个群的消息（含正文），大群可到几十 MB
           · `_index` / `_by_name` —— 文件索引（扫消息 JSON 所在文件夹建出来的，
             一个群几百上千个文件时也是上千个 Path 对象）
-          · `_viewers` —— 已打开的内置查看器（各自持有解码后的图像 / 视频帧）
+          · `_viewer` —— 内置查看器（持有解码后的图像 / 视频帧，以及解码后端）
         保留 `_path`（恢复时要按它重新加载）、页码与筛选条件（属用户输入，不占内存）。
         返回卸载掉的条目数（0 = 本来就没加载东西）。
         """
         if self._released:
             return 0
         n = len(self._all) + len(self._index) + len(self._by_name)
-        if n == 0 and not self._viewers and not self._groups:
+        if n == 0 and self._viewer is None and not self._groups:
             return 0
         self._page_keep = self._page
         self.teardown()                          # 停表 + 清队列/分组 + 销毁卡片
-        for v in list(self._viewers):
-            try:
-                v.close()
-                v.deleteLater()
-            except (RuntimeError, AttributeError):
-                pass
-        self._viewers = []
+        self._destroy_viewer()
         self._all = []
         self._index.clear()
         self._by_name.clear()
@@ -1148,30 +1153,73 @@ class MsgBrowser(QWidget):
         self.open_path(p)
 
     def open_path(self, path: Path) -> None:
-        """用内置查看器打开；格式不支持或 QtMultimedia 缺失时退化为系统程序。"""
-        self._prune_viewers()
+        """用内置查看器打开；格式不支持或 QtMultimedia 缺失时退化为系统程序。
+
+        ⚠️ **单实例复用**（10-11 改）：已有实例就**直接复用**（换媒体列表 + 切到目标项），
+        而不是新建一个。原因见 `_viewer` 的注释：用户习惯「看完一个关掉、再点下一个」，
+        每次新建都会重建一整套 WMF 解码后端 —— 日志实测两分钟开关 8 次，
+        第 9 次创建时 access violation。复用之后后端只在第一次打开时建一次。
+        """
+        # 崩溃日志上下文：万一打开查看器时崩了，能一眼看出崩在什么类型的文件上
+        try:
+            from . import crashlog
+            crashlog.set_context("viewer", str(path.suffix).lower() or "无后缀")
+        except Exception:                                     # noqa: BLE001
+            pass
+
+        if not is_viewable(path):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+            return
+
         idx, items = 0, [(Path(path), "")]
         for i, pair in enumerate(self._open_list):
             if pair[0] == path:                        # _open_list = [(路径, 消息编号)]
                 idx, items = i, list(self._open_list)
                 break
-        viewer = open_media(items, idx, self) if is_viewable(path) else None
+
+        # ---- 复用已有的查看器 ----
+        v = self._viewer
+        if v is not None:
+            if _qt_alive(v):
+                try:
+                    v.set_items(items, idx)            # 只换列表 / 切项，后端原样不动
+                    v.show()
+                    v.raise_()
+                    v.activateWindow()
+                    return
+                except (RuntimeError, AttributeError):
+                    pass
+            self._viewer = None                        # 已失效（父窗销毁等）→ 走新建
+
+        viewer = open_media(items, idx, self)
         if viewer is None:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
             return
-        # 关闭即销毁（不留隐藏窗口）——注意销毁后 Python 包装会变成悬空引用，
-        # 必须靠 destroyed 回调 / _prune_viewers 及时摘除，否则下次打开会抛
-        # RuntimeError: Internal C++ object already deleted
-        viewer.setAttribute(Qt.WA_DeleteOnClose, True)
-        self._viewers.append(viewer)
+        # ⚠️ 刻意**不设** WA_DeleteOnClose：关窗要能复用，销毁交给 _destroy_viewer()
+        self._viewer = viewer
         try:
-            viewer.destroyed.connect(lambda *_: self._prune_viewers())
             viewer.goto_message.connect(self.jump_to_message)   # 「跳转到该条消息」
         except (RuntimeError, TypeError):              # pragma: no cover
             pass
         viewer.show()
         viewer.raise_()
         viewer.activateWindow()
+
+    def _destroy_viewer(self) -> None:
+        """**真正**销毁查看器（释放它持有的解码后端）。
+
+        只用在「卸载 JSON / 切后台释放内存」这类确需回收的场合；
+        日常关窗走的是「隐藏复用」，见 `open_path`。
+        """
+        v = self._viewer
+        self._viewer = None
+        if v is None:
+            return
+        try:
+            v.close()
+            v.deleteLater()
+        except (RuntimeError, AttributeError):
+            pass
 
     def _show_card_menu(self, item: MsgItem) -> None:
         """卡片右键菜单：跳转到该条消息 / 复制编号。"""
@@ -1233,17 +1281,6 @@ class MsgBrowser(QWidget):
             if isinstance(w, MsgItem):
                 out.append(w)
         return out
-
-    def _prune_viewers(self) -> None:
-        """摘除已关闭（C++ 对象已销毁）的查看器引用。"""
-        alive: list[QDialog] = []
-        for v in self._viewers:
-            try:
-                if v.isVisible():
-                    alive.append(v)
-            except RuntimeError:                       # 对象已随关闭销毁
-                pass
-        self._viewers = alive
 
     def search_tag(self, tag: str) -> None:
         """点 #标签 → 填入搜索框按该标签筛选（再点一次同一个标签则清空）。"""

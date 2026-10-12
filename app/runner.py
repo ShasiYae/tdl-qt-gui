@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 
 from PySide6.QtCore import QObject, Signal
 
-from . import procutil
+from . import console_mirror, procutil
 
 
 # ============================================================================
@@ -152,10 +152,14 @@ class TdlRunner(QObject):
     信号从线程 emit（Qt 自动 queued 切回主线程），GUI 不卡、退出必达。
     """
 
-    line_out = Signal(str)
-    line_err = Signal(str)
+    # ⚠️ 载荷是 **list[str]**（一整块），不再是单行 —— 见 `_pump_out` 的说明。
+    #    下载高峰时逐行 emit 会把主线程事件队列塞爆。
+    line_out = Signal(list)
+    line_err = Signal(list)
     started_ = Signal(list)
     finished_ = Signal(object)
+    # 「tdl 窗口」被用户关掉（点 X 等）时发出，让界面同步取消勾选
+    mirror_closed = Signal()
 
     def __init__(self, tdl_path: str, parent=None):
         super().__init__(parent)
@@ -166,6 +170,10 @@ class TdlRunner(QObject):
         self._err_buf = LineBuffer()
         self._pending: list[list[str]] = []   # 命令队列（备用）
         self._queue_total = 1
+        # 「tdl 窗口」镜像（测试/验证用）：把收到的原始输出**再打一份**到独立控制台
+        # 窗口，这样界面里的卡片与 tdl 原本那套进度条能同时看到（见 app/console_mirror.py）。
+        # None = 没开（默认）。开关在「运行输出」标题栏的复选框。
+        self._mirror = None
 
     # ---------------------------------------------------------------- 状态
     @property
@@ -226,7 +234,7 @@ class TdlRunner(QObject):
 
         ok, msg = self.available()
         if not ok:
-            self.line_err.emit(f"[错误] {msg}")
+            self.line_err.emit([f"[错误] {msg}"])
             return False
 
         self._record = RunRecord(argv=list(argv))
@@ -250,10 +258,10 @@ class TdlRunner(QObject):
                 creationflags=flags,
             )
         except OSError as exc:
-            self.line_err.emit(f"[错误] 进程启动失败：{exc}")
-            self.line_err.emit(f"[诊断] tdl={self.tdl_path} "
-                               f"存在={os.path.isfile(self.tdl_path)} "
-                               f"cwd={os.getcwd()}")
+            self.line_err.emit([f"[错误] 进程启动失败：{exc}"])
+            self.line_err.emit([f"[诊断] tdl={self.tdl_path} "
+                                f"存在={os.path.isfile(self.tdl_path)} "
+                                f"cwd={os.getcwd()}"])
             self._proc = None
             return False
 
@@ -262,9 +270,20 @@ class TdlRunner(QObject):
         # 「占着账号数据库锁的残留 tdl」。失败不影响正常使用（退出路径还有兜底）。
         procutil.assign_kill_on_close_job(self._proc.pid)
 
+        # 「tdl 窗口」：开关开着且当前没有窗口才起一个（**复用已存在的**，绝不强覆盖
+        # 用户可能已经在跑命令中途点过按钮了）。命令结束也不抢走窗口 —— 它跟随开关状态
+        # （见 `_watch` 与界面的「tdl 窗口」按钮 `_on_mirror_clicked`），
+        # 于是变成「随时显示 / 关闭」模式。
+        if self._mirror is None and console_mirror.enabled():
+            self._mirror = console_mirror.start_if_enabled()
+
         # 两个读线程 + 一个看护线程（守护线程，GUI 退出即消亡）
-        threading.Thread(target=self._pump_out, daemon=True).start()
-        threading.Thread(target=self._pump_err, daemon=True).start()
+        # ⚠️ 读线程的引用要留住 —— `_watch` 必须等它们**把管道读干净**才能发 finished_
+        #    （见 `_watch` 里的说明：不等就会在「输出还没收全」时触发完成处理）。
+        self._out_thread = threading.Thread(target=self._pump_out, daemon=True)
+        self._err_thread = threading.Thread(target=self._pump_err, daemon=True)
+        self._out_thread.start()
+        self._err_thread.start()
         threading.Thread(target=self._watch, daemon=True).start()
         self.started_.emit(list(argv))
         return True
@@ -274,22 +293,43 @@ class TdlRunner(QObject):
         proc = self._proc
         if proc is None or proc.stdout is None:
             return
-        # 增量解码：tdl 输出含中文，read(4096) 会在任意字节处切断多字节字符，
+        # 增量解码：tdl 输出含中文，一次 read 会在任意字节处切断多字节字符，
         # 逐块 decode 会把半个汉字变成 "�"（任务名因此不稳定 → 卡片重复）
         dec = codecs.getincrementaldecoder("utf-8")("replace")
         try:
-            for chunk in iter(lambda: proc.stdout.read(4096), b""):
+            # ⚠️⚠️ **必须是 read1，不能是 read**（v2.10.10 修）：
+            #    `BufferedReader.read(n)` 会**一直等到读满 n 字节**（实测：写入不足
+            #    4096 字节时它会阻塞到进程结束才返回），而 tdl 每 0.1 秒才写 ~200 字节
+            #    → 攒满 4096 要 2 秒 → 界面每 2 秒才刷新一次 → 「网速不实时」。
+            #    `read1(n)` 只做一次底层 read，**有多少返多少**（实测 0.31s 首次到达、
+            #    之后每 0.10s 一批），与 tdl 自己的写频率一致。
+            #    ⚠️ 一批 = 一次 read 的结果，所以 emit 频率 ≈ tdl 的写频率（10/s）——
+            #       **既实时，又不会像逐行 emit 那样把主线程队列塞爆**。
+            for chunk in iter(lambda: proc.stdout.read1(65536), b""):
                 if not chunk:
                     break
+                # ⚠️ 镜像走**原始字节**（v2.12.1）：tdl 的进度条靠
+                #    `\x1b[A\x1b[K`（上移 N 行 + 清行）原地重画，这套控制符在下面
+                #    的 LineBuffer 里会被 strip_ansi 剥掉 → 镜像窗口变成满屏乱码。
+                #    所以在解码/切行**之前**就把原始字节透传过去。
+                self._feed_mirror(chunk)
                 text = dec.decode(chunk)
-                for ln in self._out_buf.feed(text):
-                    if self._record:
-                        self._record.output.append(ln)
-                    self.line_out.emit(ln)
+                # ⚠️ **整块 emit**（v2.10.9）：原来这里逐行 `emit(ln)`，
+                #    下载高峰时每行一条跨线程事件 → 主线程队列积压 → 内存飙 + 崩。
+                #    现在把这次 read 出来的行**打包成一批**发出去，emit 次数降 1~2 个量级。
+                batch = self._out_buf.feed(text)
+                if not batch:
+                    continue
+                if self._record:
+                    self._record.output.extend(batch)
+                self.line_out.emit(batch)
             tail = dec.decode(b"", True)
             if tail:
-                for ln in self._out_buf.feed(tail):
-                    self.line_out.emit(ln)
+                batch = self._out_buf.feed(tail)
+                if batch:
+                    if self._record:
+                        self._record.output.extend(batch)
+                    self.line_out.emit(batch)
         except (OSError, ValueError):
             pass
 
@@ -299,16 +339,62 @@ class TdlRunner(QObject):
             return
         dec = codecs.getincrementaldecoder("utf-8")("replace")
         try:
-            for chunk in iter(lambda: proc.stderr.read(4096), b""):
+            # 同 _pump_out：read1 = 有多少返多少（stderr 一样不能憋批）
+            for chunk in iter(lambda: proc.stderr.read1(65536), b""):
                 if not chunk:
                     break
+                self._feed_mirror(chunk)
                 text = dec.decode(chunk)
-                for ln in self._err_buf.feed(text):
-                    if self._record:
-                        self._record.output.append(ln)
-                    self.line_err.emit(ln)
+                batch = self._err_buf.feed(text)          # 同 _pump_out：整块发
+                if not batch:
+                    continue
+                if self._record:
+                    self._record.output.extend(batch)
+                self.line_err.emit(batch)
         except (OSError, ValueError):
             pass
+
+    # ---------------------------------------------------------- 「tdl 窗口」镜像
+    def _feed_mirror(self, chunk: bytes) -> None:
+        """把**原始字节**原样镜像到「tdl 窗口」（没开就是空操作；失败静默）。
+
+        ⚠️ 收的是 `read1` 刚返回的原始 chunk，**不是**切好行的文本：
+        见 `_pump_out` 里的说明（切行会剥掉 ANSI，镜像就成满屏乱码）。
+        """
+        m = self._mirror
+        if m is not None:
+            m.feed_bytes(chunk)
+
+    def _close_mirror(self) -> None:
+        """收尾：关掉镜像窗口。
+
+        ⚠️ **必须后台做** —— 关窗要等子进程退出（最多 1.5 秒），而本方法会在
+        `_watch` 里、`finished_` 之前被调用；同步等待会把这个信号一起拖慢。
+        """
+        m, self._mirror = self._mirror, None
+        if m is not None:
+            m.on_closed = None          # 主动关窗不触发「被关闭」回调
+            threading.Thread(target=m.stop, daemon=True).start()
+
+    def set_mirror(self, on: bool) -> bool:
+        """运行时开关「tdl 窗口」；返回现在是否开着（供界面复选框调用）。
+
+        开：若当前没有窗口就新建并把「被关闭」回调接到本 runner（这样用户点窗口
+            X 关掉时我们能清掉引用 + 同步取消勾选）；关：立即关窗。
+        """
+        if on:
+            if self._mirror is None:
+                self._mirror = console_mirror.start_if_enabled()
+                if self._mirror is not None:
+                    self._mirror.on_closed = self._on_mirror_closed
+            return self._mirror is not None
+        self._close_mirror()
+        return False
+
+    def _on_mirror_closed(self) -> None:
+        """窗口（子进程）被用户关掉（点 X 等）：清掉引用并发信号让界面取消勾选。"""
+        self._mirror = None
+        self.mirror_closed.emit()
 
     def _watch(self) -> None:
         """看护线程：等进程退出 → flush 缓冲 → 发 finished（跨线程 queued）。"""
@@ -319,15 +405,31 @@ class TdlRunner(QObject):
             code = proc.wait()
         except OSError:
             code = -1
+        # ⚠️⚠️ **必须等两个读线程把管道读干净，再发 finished_**（v2.10.2 修）
+        #
+        # `proc.wait()` 在子进程退出的**那一瞬间**就返回了，可 stdout 管道里往往
+        # 还有没读完的字节；而读线程是**另外两个线程**，它们的 `line_out` 是
+        # **跨线程队列投递**。三条信号谁先入主线程的队列，谁就先被处理 ——
+        # 于是 `finished_` 有可能**抢在最后一批输出之前**被处理。
+        #
+        # 后果：`_advance_export` 在 `_ls_lines` 还空着的时候就开始解析 →
+        # `chat ls` 明明成功了（退出码 0）却报「取不到会话列表」。
+        # **输出越大越容易中**（会话列表 JSON 十几万字符，踩中概率很高），
+        # 而且**是偶发的** —— 典型的线程竞态。
+        for _th in (getattr(self, "_out_thread", None), getattr(self, "_err_thread", None)):
+            if _th is not None:
+                _th.join(timeout=5)          # 读线程在管道 EOF 后会自行结束，join 基本立刻返回
         # 缓冲里可能还有最后半行
-        for ln in self._out_buf.flush():
+        _b = self._out_buf.flush()
+        if _b:
             if self._record:
-                self._record.output.append(ln)
-            self.line_out.emit(ln)
-        for ln in self._err_buf.flush():
+                self._record.output.extend(_b)
+            self.line_out.emit(_b)
+        _e = self._err_buf.flush()
+        if _e:
             if self._record:
-                self._record.output.append(ln)
-            self.line_err.emit(ln)
+                self._record.output.extend(_e)
+            self.line_err.emit(_e)
 
         if self._record:
             self._record.finished_at = time.time()
@@ -335,13 +437,18 @@ class TdlRunner(QObject):
             self._record.exit_status = "正常退出" if code == 0 else "异常退出"
         rec = self._record
         self._proc = None
+        # 「tdl 窗口」跟随开关状态（v2.13.1 改成「随时显示 / 关闭」模式）：
+        # 开关开着就**保留**窗口（用户随时能看最后的内容、也能随时关掉），
+        # 不再被命令结束强行收走；开关关着才在这里收掉。主动开关由 set_mirror 处理。
+        if not console_mirror.enabled():
+            self._close_mirror()
         self.finished_.emit(rec)
 
         # 队列接续（备用）：前一条成功才跑下一条
         if self._pending and rec is not None and rec.exit_code == 0:
             nxt = self._pending.pop(0)
             done = self._queue_total - len(self._pending)
-            self.line_err.emit(f"[队列] {done}/{self._queue_total} 完成，继续下一条…")
+            self.line_err.emit([f"[队列] {done}/{self._queue_total} 完成，继续下一条…"])
             self.start(nxt)
         else:
             self._pending = []
@@ -378,10 +485,10 @@ class TdlRunner(QObject):
                 rec.exit_code = -1
                 rec.exit_status = "已终止"
                 self._proc = None
-                self.line_err.emit("[已取消] 进程未在运行，已复位。")
+                self.line_err.emit(["[已取消] 进程未在运行，已复位。"])
                 self.finished_.emit(rec)
             return
-        self.line_err.emit("[已取消] 正在终止进程…")
+        self.line_err.emit(["[已取消] 正在终止进程…"])
         pid = proc.pid
         try:
             proc.kill()
@@ -405,6 +512,7 @@ class TdlRunner(QObject):
         （不同 --ns 用的是不同库文件，本可以并行）。
         """
         self._pending = []
+        self._close_mirror()
         proc, self._proc = self._proc, None
         if proc is None:
             return True, []
@@ -438,7 +546,7 @@ class TdlRunner(QObject):
 
     def line_sys(self, text: str) -> None:
         """系统提示行（走 err 通道简化处理）。"""
-        self.line_err.emit(text)
+        self.line_err.emit([text])
 
 
 def split_flag(flag: str) -> str:

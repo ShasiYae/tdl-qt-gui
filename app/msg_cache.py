@@ -140,3 +140,90 @@ def drop_cache(path: str | Path) -> bool:
         return True
     except OSError:
         return False
+
+
+def _merge_by_id(old: list, new: list) -> list[dict]:
+    """按消息 id 合并两个列表：同 id 以 **new** 为准，结果按 id 升序。
+
+    没有 id（或 id 不是整数）的消息原样保留在末尾，不参与去重。
+    """
+    def _key(m: dict):
+        try:
+            return int(m.get("id"))
+        except (TypeError, ValueError):
+            return None
+
+    out: dict = {}
+    tail: list[dict] = []
+    for m in new:                       # 先放新的：同 id 时由它占住坑
+        if not isinstance(m, dict):
+            continue
+        k = _key(m)
+        if k is None:
+            tail.append(m)
+        else:
+            out[k] = m
+    for m in old:                       # 再补旧的：同 id 已被新的占了就跳过
+        if not isinstance(m, dict):
+            continue
+        k = _key(m)
+        if k is None:
+            continue
+        out.setdefault(k, m)
+    merged = [out[k] for k in sorted(out)]
+    merged.extend(tail)
+    return merged
+
+
+def merge_into_slim(src: str | Path, new_msgs: list[dict]) -> int:
+    """把新导出的消息**合并进既有的精简文件**，并重新去重。
+
+    为什么要它：分多次导出时正式消息 json 会被反复合并扩充，而精简缓存是靠
+    「源文件 size + mtime」判断有效性的 —— 只更新正式文件的话，精简文件会失效，
+    要等下次打开才重建。这里在**导出完成时就一并合并进去**，浏览时立刻能看到新消息。
+
+    规则（与 `paths.merge_export_json` 一致）：按消息 id 去重、同 id 以本次为准、
+    结果按 id 升序；随后整体再跑一次 `dedup_keep_ends`（重复文字保留首末）。
+    写盘后**刷新 `_slim` 元信息到更新后的正式文件**，缓存继续保持有效。
+
+    `src` = 正式消息 json 的路径；`new_msgs` = 本次导出的消息列表。
+    返回合并后的条数；精简文件不存在 / 不可解析 / 写盘失败 → 返回 **-1**
+    （下次打开会自然重建，不影响使用）。
+    """
+    src = Path(src)
+    slim = slim_path(src)
+    if not slim.exists():
+        return -1
+    try:
+        d = json.loads(slim.read_text(encoding="utf-8"))
+        old = d.get("messages")
+        if not isinstance(old, list):
+            return -1
+        chat_id = d.get("id", "")
+    except (OSError, ValueError, UnicodeDecodeError):
+        return -1
+
+    merged = _merge_by_id(old, list(new_msgs or []))
+    kept, _removed = dedup_keep_ends(merged)
+
+    try:
+        st = src.stat()                  # 元信息对齐**更新后**的正式文件
+    except OSError:
+        return -1
+    payload = {
+        "_slim": {
+            "src": src.name,
+            "size": st.st_size,
+            "mtime_ns": st.st_mtime_ns,
+            "removed": len(merged) - len(kept),
+            "kept": len(kept),
+            "built": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        },
+        "id": chat_id,
+        "messages": [_keep_fields(m) for m in kept],
+    }
+    try:
+        slim.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        return -1
+    return len(kept)

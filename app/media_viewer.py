@@ -99,6 +99,23 @@ def _kind_of(path: str | Path) -> str:
     return ""
 
 
+def _qt_alive(obj) -> bool:
+    """Qt 包装对象是否仍然有效（C++ 侧没被销毁）。
+
+    单实例复用需要它：查看器的 parent 是消息浏览器，父窗销毁会连带删掉查看器，
+    而 Python 侧还留着引用 —— 不检查就会踩 `Internal C++ object already deleted`。
+    """
+    try:
+        from shiboken6 import isValid
+        return bool(isValid(obj))
+    except Exception:                                                 # noqa: BLE001
+        try:
+            obj.isVisible()                                            # 访问一下即知
+            return True
+        except Exception:                                             # noqa: BLE001
+            return False
+
+
 def is_viewable(path: str | Path) -> bool:
     """该文件是否能用内置查看器打开。"""
     k = _kind_of(path)
@@ -346,9 +363,26 @@ class VideoCanvas(ImageCanvas):
         self._dirty = False                       # 有待生效的调色改动
         self._tick = None                         # 节流 tick（见 _ensure_tick）
         self.setCursor(Qt.OpenHandCursor)
-        self.sink = QVideoSink(self) if HAVE_QTMM else None
+        # ⚠️ QVideoSink **不在这里创建**（惰性，见 `ensure_sink`）：
+        #    它属于 QtMultimedia，而**看图片根本用不到它**；更要紧的是，
+        #    2026-10-11 那次「闪退」正是崩在 `QVideoSink(self)` 这一行
+        #    （Windows fatal exception: access violation）。推迟到真要播视频时再建，
+        #    等于把这条崩溃路径从「每次打开查看器」收窄到「只有播视频时」。
+        self.sink = None
+
+    def ensure_sink(self) -> bool:
+        """惰性创建 QVideoSink。返回是否可用（真要播视频时才调）。"""
         if self.sink is not None:
+            return True
+        if not HAVE_QTMM:
+            return False
+        try:
+            self.sink = QVideoSink(self)
             self.sink.videoFrameChanged.connect(self._on_frame)
+        except Exception:                                 # noqa: BLE001
+            self.sink = None
+            return False
+        return True
 
     # ---------------------------------------------------------------- 画面调节
     def set_params(self, bright: int = 0, contrast: int = 0, sat: int = 0) -> None:
@@ -891,24 +925,15 @@ class MediaViewer(QDialog):
         cl.addWidget(self.lbl_hint)
         root.addWidget(ctl)
 
-        # ---------------- 播放器 ----------------
+        # ---------------- 播放器：**惰性创建**（见 _ensure_media_backend）----------------
+        # ⚠️ 不在这里建 QMediaPlayer / QAudioOutput：它们同属 QtMultimedia，**看图片用不到**，
+        #    而创建它们要在 C++ 侧把媒体后端拉起来（10-11 那次闪退就崩在这条链上）。
+        #    真要播视频/音频时才建。代码里所有用到 player/audio 的地方本来就都有
+        #    `is not None` 判断，所以这里置 None 是安全的。
+        self.player = None
+        self.audio = None
         if HAVE_QTMM:
-            self.player = QMediaPlayer(self)
-            self.audio = QAudioOutput(self)
-            self.audio.setVolume(self.slider_vol.value() / 100)     # 沿用记忆音量
-            self.player.setAudioOutput(self.audio)
-            if self.video is not None and self.video.sink is not None:
-                # 视频输出到画布的 QVideoSink（自绘 + 可调色），不再是 QVideoWidget
-                self.player.setVideoOutput(self.video.sink)
             self.slider_vol.valueChanged.connect(self._on_vol)
-            self.player.positionChanged.connect(self._on_position)
-            self.player.durationChanged.connect(self._on_duration)
-            self.player.playbackStateChanged.connect(self._on_play_state)
-            self.player.mediaStatusChanged.connect(self._on_status)
-            self.player.errorOccurred.connect(self._on_error)
-        else:                                        # pragma: no cover
-            self.player = None
-            self.audio = None
 
         self._timer = QTimer(self)
         self._timer.setInterval(200)
@@ -990,6 +1015,51 @@ class MediaViewer(QDialog):
     def _sync_max_btn(self) -> None:
         self.btn_win_max.setText(
             "还原" if (self.isMaximized() or self.isFullScreen()) else "最大化")
+
+    def _ensure_media_backend(self) -> bool:
+        """首次要播视频/音频时，才创建 QtMultimedia 那套对象。返回是否可用。
+
+        ⚠️ 为什么要惰性：`QMediaPlayer` / `QAudioOutput` / `QVideoSink` 都属于
+        QtMultimedia，创建时要在 C++ 侧把媒体后端拉起来 —— 而**看图片根本用不到**，
+        却每次打开查看器都要建一遍。2026-10-11 那次闪退就崩在这条链上
+        （`QVideoSink(self)`，Windows access violation）。
+        推迟到真要播时才建，等于把这条崩溃路径从「打开任何媒体」收窄到「播视频/音频」。
+        建不出来就返回 False，调用方静默降级（不播），**不带崩程序**。
+        """
+        if self.player is not None:
+            return True
+        if not HAVE_QTMM:
+            return False
+        # 关键路径打点：崩溃日志里能看出「崩之前媒体后端被创建过几次/什么时候释放的」
+        _note = lambda t: None                                        # noqa: E731
+        try:
+            from . import crashlog
+            _note = lambda t: crashlog.note("MEDIA", t)               # noqa: E731
+        except Exception:                                             # noqa: BLE001
+            pass
+        _note("创建媒体后端…")
+        if self.video is not None:
+            self.video.ensure_sink()
+        try:
+            self.player = QMediaPlayer(self)
+            self.audio = QAudioOutput(self)
+            self.audio.setVolume(self.slider_vol.value() / 100)     # 沿用记忆音量
+            self.player.setAudioOutput(self.audio)
+            if self.video is not None and self.video.sink is not None:
+                # 视频输出到画布的 QVideoSink（自绘 + 可调色），不再是 QVideoWidget
+                self.player.setVideoOutput(self.video.sink)
+            self.player.positionChanged.connect(self._on_position)
+            self.player.durationChanged.connect(self._on_duration)
+            self.player.playbackStateChanged.connect(self._on_play_state)
+            self.player.mediaStatusChanged.connect(self._on_status)
+            self.player.errorOccurred.connect(self._on_error)
+        except Exception as e:                            # noqa: BLE001
+            _note(f"创建媒体后端失败：{type(e).__name__}: {e}")
+            self.player = None
+            self.audio = None
+            return False
+        _note("媒体后端创建完成")
+        return True
 
     def _on_vol(self, v: int) -> None:
         """音量变化：同步播放器 + 记入偏好（去抖落盘）。"""
@@ -1133,11 +1203,40 @@ class MediaViewer(QDialog):
                 self.lbl_audio.setText(f"🎵　{path.name}" if is_audio else "")
                 self.lbl_audio.setVisible(is_audio)
                 self.lbl_audio.setGeometry(self._video_host.rect())
-            if self.player is not None:
+            # 视频/音频：**到这里才**把 QtMultimedia 那套对象建起来。
+            # 看图片走的是上面那个分支，全程不碰它 —— 这条崩溃路径就此收窄。
+            # 建不出来（环境缺件 / 后端异常）就静默降级，只是不播，不带崩程序。
+            if self._ensure_media_backend():
+                # ⚠️ 切换媒体时**先把旧源停掉**再设新源。
+                #    原来直接 `setSource(新源)` —— 等于让 WMF 在**跑着的解码器**上换输入；
+                #    用户「在几个媒体之间来回切换」时最容易踩（10-11 第二次崩溃正是这种用法）。
+                #    图片分支本来就先 `stop()` 了，视频分支漏了这一步。
+                try:
+                    self.player.stop()
+                except (RuntimeError, TypeError):         # noqa: BLE001
+                    pass
                 self.player.setSource(QUrl.fromLocalFile(str(path)))
                 self.player.play()
                 self._timer.start()
+                try:
+                    from . import crashlog
+                    crashlog.note(
+                        "MEDIA",
+                        f"放 {path.name[:60]}（第 {self._index + 1}/{len(self._items)} 项）")
+                except Exception:                                     # noqa: BLE001
+                    pass
         self._sync_type_ui()
+
+    def set_items(self, items, index: int = 0) -> None:
+        """换一批媒体并切到指定项 —— **复用本实例，不重建解码后端**。
+
+        单实例复用的入口（见 `msg_view.open_path`）：查看器关闭只是隐藏，
+        下次打开走这里，QMediaPlayer / QVideoSink 原样沿用，只换播放源。
+        """
+        self._items = list(items or [])
+        n = len(self._items)
+        self._index = max(0, min(int(index), n - 1)) if n else 0
+        self._load(self._index)
 
     def _sync_type_ui(self) -> None:
         """按当前媒体类型切换控件可见性与提示文案。"""
@@ -1424,16 +1523,31 @@ class MediaViewer(QDialog):
         else:
             super().keyPressEvent(e)
 
-    def closeEvent(self, e) -> None:
-        self._timer.stop()
-        self._pref_timer.stop()
-        self._save_prefs()                         # 关窗时记住窗口大小与音量
+    def _stop_playback(self) -> None:
+        """关窗时**只停播**，不动后端对象、也不断开视频输出。
+
+        ⚠️ 这里刻意撤掉了 2.10.5 加过的 `setVideoOutput(None)`（10-11 再改回）：
+        方案已从「关窗彻底释放」改成「**关窗保留、下次复用**」（见 msg_view.open_path）。
+        断开输出之后复用还得重连，**重连同样会惊动解码器** —— 而我们要的正是
+        让后端一直活着、别反复折腾。所以关窗只做「停源」这一件事。
+        """
         try:
             if self.player is not None:
                 self.player.stop()
                 self.player.setSource(QUrl())
-        except RuntimeError:                       # pragma: no cover
+                try:
+                    from . import crashlog
+                    crashlog.note("MEDIA", "关窗停播（后端保留复用）")
+                except Exception:                                     # noqa: BLE001
+                    pass
+        except (RuntimeError, TypeError):              # noqa: BLE001
             pass
+
+    def closeEvent(self, e) -> None:
+        self._timer.stop()
+        self._pref_timer.stop()
+        self._save_prefs()                         # 关窗时记住窗口大小与音量
+        self._stop_playback()
         super().closeEvent(e)
 
 

@@ -202,6 +202,41 @@ def working_set_mb():
         return None
 
 
+def res_counts() -> tuple:
+    """(GDI 对象数, USER 对象数, 内核句柄数) —— 判断"是不是资源在累积"用。
+
+    ⚠️ 为什么要三个都取：「崩在创建 Qt 对象时」既可能是 GDI/USER 满了
+    （Windows 默认每进程各 10000），也可能是**内核句柄**（文件/事件/线程句柄）泄漏。
+    只测前两个会漏掉第三类。任何一项取不到就当 0，绝不抛。
+    """
+    if sys.platform != "win32":
+        return (0, 0, 0)
+    gdi = usr = hcount = 0
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # ⚠️ GetGuiResources 在 **user32**，不在 kernel32
+        u32 = ctypes.WinDLL("user32", use_last_error=True)
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        # ⚠️ 必须显式声明 argtypes：`GetCurrentProcess()` 返回的是**伪句柄 -1**，
+        #    ctypes 默认按 c_int 转换会直接 OverflowError（"int too long to convert"）——
+        #    那样整个函数静默返回 (0,0,0)，日志里就一直是 0，等于没记。
+        u32.GetGuiResources.argtypes = [wintypes.HANDLE, ctypes.c_uint]
+        u32.GetGuiResources.restype = ctypes.c_ulong
+        k32.GetProcessHandleCount.argtypes = [wintypes.HANDLE,
+                                              ctypes.POINTER(ctypes.c_ulong)]
+        h = k32.GetCurrentProcess()
+        gdi = int(u32.GetGuiResources(h, 0))
+        usr = int(u32.GetGuiResources(h, 1))
+        n = ctypes.c_ulong(0)
+        if k32.GetProcessHandleCount(h, ctypes.byref(n)):
+            hcount = int(n.value)
+    except Exception:                                     # noqa: BLE001
+        pass
+    return (gdi, usr, hcount)
+
+
 def trim_memory() -> None:
     """尽力把已经空闲的内存**还给系统**（否则 Python / Qt 会把空闲页留在工作集里）。
 

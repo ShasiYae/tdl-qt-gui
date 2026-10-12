@@ -36,6 +36,8 @@ from .data import (
 )
 from . import paths
 from . import envcheck
+from . import console_mirror
+from . import prefs
 from . import deploy
 from . import deploy_flow
 from .widgets import ElidedLabel, NavItem, HubTab, GroupBox, hand_cursor
@@ -75,6 +77,36 @@ def _tdl_note(line: str) -> str:
         if needle.lower() in t:
             return cn
     return ""
+
+
+def _export_lookup_error(key: str, chats: list, ls_lines: list) -> tuple[str, list[str]]:
+    """导出时匹配不到目标群组 → 生成（状态栏文本, 要打印的说明行）。
+
+    为什么要分两种情形（v2.10.1）：`chat ls` 的输出**不显示在界面上**
+    （查询阶段静默，避免 JSON 刷屏），所以一旦失败，用户手里什么线索都没有。
+    而「压根没取到列表」（未登录 / 账号库被占用 / 网络不通）和
+    「列表里没有这个群」（群号填错）过去共用同一句「群组未找到」——
+    用户完全没法判断该去登录还是该改群号。
+    """
+    if not chats:
+        lines = [
+            "[导出失败] 没能从 tdl 取到会话列表 —— 这**不是群号填错**。",
+            "  常见原因：还没登录 Telegram 账号 / 账号数据被别的 tdl 进程占用 / 网络不通。",
+        ]
+        tail = [x for x in (ls_lines or []) if str(x).strip()][-6:]
+        if tail:
+            lines.append("  命令输出（末尾几行）：")
+            lines += [f"    {x.strip()}" for x in tail]
+        return "取不到会话列表", lines
+
+    brief = "、".join(
+        f"{c.get('visible_name') or '?'}（{c.get('id')}）" for c in chats[:6])
+    more = "" if len(chats) <= 6 else f" 等 {len(chats)} 个"
+    return "群组未找到", [
+        f"[导出失败] 会话列表里没有匹配「{key}」的群组。",
+        f"  实际可用{more}：{brief}",
+        "  可填：@用户名、纯群号（如 2305571652）、完整 id（-100…）或群名。",
+    ]
 
 
 
@@ -503,6 +535,22 @@ class Content(QWidget):
         self._log_state = QLabel("就绪")
         self._log_state.setObjectName("FieldHelp")
         lh.addWidget(self._log_state)
+        # 「tdl 窗口」：把 tdl 的原始输出**原样**再显示在一个独立的控制台窗口里。
+        # 为什么不能直接显示 tdl 自己的窗口：GUI 用管道接走了它的 stdout，那个窗口
+        # 根本不会出现；而命令行程序的输出必须由**拥有控制台窗口的进程**渲染 ——
+        # 所以这里另起一个只做回显的独立进程（见 app/console_mirror.py）。
+        # ⭐ 用**按钮**（不是复选框）：点一下**立刻**开 / 关那个窗口。
+        # 复选框只能「记个设置」，非得等有命令在跑才把窗口带出来，做不到「随时打开」。
+        self._mirror_on = console_mirror.enabled()
+        self._btn_mirror = QToolButton()
+        self._btn_mirror.setToolTip(
+            "点一下立刻打开 / 关闭一个独立控制台窗口，把 tdl 的原始输出**原样**显示在里面"
+            "（对照排查用）。\n开着的时候每次命令也会自动带上；关掉那个窗口不会影响本程序。")
+        hand_cursor(self._btn_mirror)
+        self._btn_mirror.setAutoRaise(True)
+        self._btn_mirror.clicked.connect(self._on_mirror_clicked)
+        self._mirror_set_on(self._mirror_on)
+        lh.addWidget(self._btn_mirror)
         lh.addStretch(1)
         self._log_toggle = QToolButton()
         self._log_toggle.setText("展开 ▾")
@@ -528,6 +576,45 @@ class Content(QWidget):
         self.msg = MsgBrowser()
 
     # ---------------------------------------------------------------- 日志
+    def _mirror_set_on(self, on: bool) -> None:
+        """更新「tdl 窗口」按钮的文案（开 / 关两态）。"""
+        self._btn_mirror.setText("关闭 tdl 窗口" if on else "打开 tdl 窗口")
+
+    def set_mirror_state(self, on: bool) -> None:
+        """同步「tdl 窗口」按钮状态（供主窗口在窗口被点 X 关掉时调用）。
+
+        ⚠️ 窗口本身归 `runner` 管；`runner` 由主窗口构造时**注入到本对象**
+        （`self.content.runner = self.runner`），所以本类不直接依赖主窗口。
+        """
+        self._mirror_on = bool(on)
+        self._mirror_set_on(bool(on))
+        if not on:                                   # 窗口被 X 关掉 → 设置也改成「关」
+            prefs.set_and_save(console_mirror.PREF_KEY, False)
+
+    def _on_mirror_clicked(self) -> None:
+        """点「tdl 窗口」按钮：**立刻**开 / 关那个独立控制台窗口。
+
+        · 关着 → 打开（并记住「开」，之后每次命令也自动带上）
+        · 开着 → 关闭（并记住「关」）
+        """
+        r = getattr(self, "runner", None)
+        if r is None:
+            self.log.err("[tdl 窗口] 还没准备好（runner 未就绪），稍后再试")
+            return
+        want = not self._mirror_on
+        # ⚠️ 必须先落设置再开：`start_if_enabled()` 会读 `enabled()`（即该设置），
+        #    不先写就还是「关」→ 窗口起不来。
+        prefs.set_and_save(console_mirror.PREF_KEY, want)
+        ok = r.set_mirror(want)
+        if want and not ok:
+            prefs.set_and_save(console_mirror.PREF_KEY, False)   # 起不来就别记成「开」
+            self.log.err("[tdl 窗口] 打不开（缺控制台版解释器，或打包成了 exe）")
+            return
+        self._mirror_on = want
+        self._mirror_set_on(want)
+        self.log.sys("[tdl 窗口] 已开启：tdl 的原始输出会显示在独立窗口里"
+                     if want else "[tdl 窗口] 已关闭")
+
     def toggle_log(self) -> None:
         on = not self.log.isVisible()
         self.set_log_visible(on)
@@ -701,6 +788,7 @@ class MainWindow(QMainWindow):
         self.runner.line_err.connect(self._on_err)
         self.runner.finished_.connect(self._on_finished)
         self.runner.started_.connect(self._on_started)
+        self.runner.mirror_closed.connect(self._on_mirror_closed)
 
         # ---- UI ----
         root = QWidget()
@@ -719,6 +807,9 @@ class MainWindow(QMainWindow):
         ml.setSpacing(0)
         self.sidebar = Sidebar()
         self.content = Content()
+        # 「tdl 窗口」按钮在 Content 上，但窗口生命周期归 runner（主窗口成员）——
+        # 把 runner 注入给 Content，按钮才能「点一下立刻开 / 关」。
+        self.content.runner = self.runner
         self.task_box = self.content.task      # 任务进度面板（跨页保留实例）
         self._bg = False                       # 是否处于「后台」（最小化 / 已隐藏到托盘）
         self._stray_refused: set = set()        # 用户已拒绝清理的残留 pid 集合（不再重复弹窗）
@@ -742,7 +833,7 @@ class MainWindow(QMainWindow):
         self.task_box.set_progress_hook(self._on_dl_progress)
         self.content.action_bar.reset_clicked.connect(self._reset_current)
 
-        # 同步命名空间显示（默认值来自 data.py）
+        # 同步命名空间显示（global_store 默认值来自 data.py）
         _ns0 = str(self.global_store.get("__ns") or "default")
         self.titlebar.ns_btn.set_name(_ns0)
         # 下拉候选来自本机 ~/.tdl/data 下的库文件（每次弹菜单重新读，新增的会自己出现）
@@ -1291,7 +1382,9 @@ class MainWindow(QMainWindow):
 
         # ── ② 安装设置 ──
         gb2 = GroupBox("安装设置")
-        ui["dir"] = self._dep_input(gb2, "部署位置", str(d), ro=True)
+        # 「部署位置」= tdl 实际装到哪儿 —— 自 2.11.4 起是软件目录下的 bin\ 子目录
+        # （ffmpeg / PATH / 环境变量仍按软件目录，见右侧流程说明）。
+        ui["dir"] = self._dep_input(gb2, "部署位置", str(paths.engine_dir()), ro=True)
         w_proxy = QWidget()
         h = QHBoxLayout(w_proxy)
         h.setContentsMargins(0, 0, 0, 0)
@@ -1426,6 +1519,7 @@ class MainWindow(QMainWindow):
     # ---- 部署页：环境状态 ----
     def _dep_collect_status(self) -> dict:
         d = paths.app_root()
+        tdl_dir = paths.engine_dir()          # tdl 实际所在（bin\）—— PATH 检查就查它
         exe = envcheck.resolve_tdl_path()
         ver = envcheck.tdl_version(exe) if exe else ""
         ff_local = (d / "ffmpeg.exe").exists()
@@ -1434,7 +1528,7 @@ class MainWindow(QMainWindow):
                 for n in [deploy.ENV_PROXY_KEY] + deploy.ENV_NAMES}
         n_set = sum(1 for v in envs.values() if v)
         ns = envcheck.namespaces()
-        has_path = deploy.path_has(str(d))
+        has_path = deploy.path_has(str(tdl_dir))
         return {
             "tdl": (f"v{ver} · {exe}" if exe else "未安装（可在本页一键安装）",
                     "ok" if exe else "bad"),
@@ -1442,7 +1536,7 @@ class MainWindow(QMainWindow):
                         else f"系统 · {ff_sys}") if (ff_local or ff_sys)
                        else "未安装（仅 --rewrite-ext 转码需要）",
                        "ok" if (ff_local or ff_sys) else "warn"),
-            "path": (f"已包含 {d}" if has_path else f"未包含 {d}",
+            "path": (f"已包含 {tdl_dir}" if has_path else f"未包含 {tdl_dir}",
                      "ok" if has_path else "bad"),
             "env": ("已配置 " + "、".join(
                         f"{k.replace('TDL_', '')}={v}"
@@ -1508,7 +1602,8 @@ class MainWindow(QMainWindow):
     # ---- 部署页：安装 / 修复 ----
     def _dep_deploy_all(self) -> None:
         ui = self._deploy_ui
-        d = paths.app_root()
+        d = paths.app_root()            # 软件目录：ffmpeg / 环境变量用它
+        d_tdl = paths.engine_dir()      # 内置引擎目录（bin\）：tdl 装这里、PATH 也写它
         proxy = ui["proxy"].text().strip()
         mirror = ui["channel"].currentData() or ""
         dl_proxy = (proxy or None) if ui["cb_dl_proxy"].isChecked() else None
@@ -1524,10 +1619,11 @@ class MainWindow(QMainWindow):
             if dl_proxy:
                 route += f" + 代理 {dl_proxy}"
             log("info", f"下载通道：{route}")
-            deploy.install_tdl(log, d, dl_proxy, force, None, mirror)
+            deploy.install_tdl(log, d_tdl, dl_proxy, force, None, mirror)
             if do_ff:
                 deploy.install_ffmpeg(log, d, dl_proxy, force, None, mirror)
-            deploy.ensure_path(log, d)
+            deploy.ensure_path(log, d)          # 软件目录（ffmpeg 可能装在这）
+            deploy.ensure_path(log, d_tdl)      # tdl 所在 bin\ —— 终端要能找到它
             deploy.apply_env(log, envs)
             deploy.export_state(d, {"proxy": proxy})
             res = deploy.check_effective(proxy, ns, run_tdl=True, log=log)
@@ -1540,7 +1636,8 @@ class MainWindow(QMainWindow):
 
     def _dep_step(self, key: str) -> None:
         ui = self._deploy_ui
-        d = paths.app_root()
+        d = paths.app_root()            # 软件目录：ffmpeg / 环境变量用它
+        d_tdl = paths.engine_dir()      # 内置引擎目录（bin\）：tdl 装这里、PATH 也写它
         proxy = ui["proxy"].text().strip()
         mirror = ui["channel"].currentData() or ""
         dl_proxy = (proxy or None) if ui["cb_dl_proxy"].isChecked() else None
@@ -1550,11 +1647,12 @@ class MainWindow(QMainWindow):
 
         def job(log):
             if key == "tdl":
-                deploy.install_tdl(log, d, dl_proxy, force, None, mirror)
+                deploy.install_tdl(log, d_tdl, dl_proxy, force, None, mirror)
             elif key == "ffmpeg":
                 deploy.install_ffmpeg(log, d, dl_proxy, force, None, mirror)
             elif key == "path":
-                deploy.ensure_path(log, d)
+                deploy.ensure_path(log, d)          # 软件目录
+                deploy.ensure_path(log, d_tdl)      # tdl 所在 bin\
             elif key == "env":
                 envs = {n: ui["env_fields"][n].text().strip()
                         for n in deploy.ENV_NAMES}
@@ -2102,15 +2200,22 @@ class MainWindow(QMainWindow):
         self.content.form_layout.addStretch(1)
 
     # ================================================================ 导出状态机
-    def _resolve_chat_from_ls(self) -> dict | None:
-        """从 chat ls -o json 的输出里解析出目标会话。"""
+    def _ls_chats(self) -> list:
+        """解析 `chat ls -o json` 的输出为会话列表；拿不到就返回**空列表**。
+
+        空列表与「列表里没匹配的群」是两回事，调用方要分开报（见 `_export_lookup_error`）。
+        """
         import json as _json
         try:
             text = "\n".join(self._ls_lines)
             data = _json.loads(text[text.index("["): text.rindex("]") + 1])
         except (ValueError, AttributeError):
-            return None
-        return paths.find_chat(data, self._export_vals.get("ex_chat", ""))
+            return []
+        return data if isinstance(data, list) else []
+
+    def _resolve_chat_from_ls(self) -> dict | None:
+        """从 chat ls -o json 的输出里解析出目标会话。"""
+        return paths.find_chat(self._ls_chats(), self._export_vals.get("ex_chat", ""))
 
     def _build_export_argv(self, chat: dict, export_all: bool) -> list[str]:
         """按目录结构约定构造 chat export 命令（-o 自动落位）。
@@ -2156,10 +2261,24 @@ class MainWindow(QMainWindow):
                 self._export_stage = None
                 self.content.action_bar.set_running(False)
                 key = self._export_vals.get("ex_chat", "")
-                self.content.log.err(f"[导出失败] 会话「{key}」不在会话列表中，"
-                                     f"请确认群号或用户名。")
-                self.content.log.set_status("群组未找到", T.DANGER)
-                self.content.set_log_state("群组未找到")
+                # 区分「没取到列表」和「列表里没这个群」—— 两者的处置方式完全不同
+                status, lines = _export_lookup_error(key, self._ls_chats(), self._ls_lines)
+                for ln in lines:
+                    self.content.log.err(ln)
+                self.content.log.set_status(status, T.DANGER)
+                self.content.set_log_state(status)
+                # 崩溃日志留档 —— ls 阶段的输出在界面上是**静默**的，
+                # 不落到日志里，事后就只能靠用户复述（10-07 就吃了这个亏）。
+                try:
+                    from . import crashlog
+                    crashlog.note("EXPORT", f"取不到群组：{status}；"
+                                            f"用户填的群组 = {key!r}；"
+                                            f"ls 阶段输出 {len(self._ls_lines)} 行")
+                    for _ln in (self._ls_lines or [])[:20]:
+                        if str(_ln).strip():
+                            crashlog.note("EXPORT-ls", str(_ln)[:300])
+                except Exception:                                 # noqa: BLE001
+                    pass
                 return
             name = chat.get("visible_name") or "chat"
             cid = chat.get("id")
@@ -2231,7 +2350,12 @@ class MainWindow(QMainWindow):
         规则（见 `paths.merge_export_json`）：按消息 id 去重，同 id 以本次为准，
         结果按 id 升序。目录里始终只有一份消息 json ——
         分多次导出不同区间自动累积；重复导出同一区间以最新为准，不重复堆叠。
+
+        ⭐ 合并完成后还会把本次消息**一并合并进精简文件**
+        （`msg_cache.merge_into_slim`）：否则精简缓存会因源文件 size/mtime 变化
+        而失效，要等下次打开才重建，浏览时看不到刚导进来的消息。
         """
+        import json as _json
         chat = self._export_chat or {}
         name = chat.get("visible_name") or "chat"
         cid = chat.get("id")
@@ -2240,6 +2364,14 @@ class MainWindow(QMainWindow):
         if not part.exists():
             return
         existed = target.exists()
+        # 先把本次导出的消息读出来 —— part 稍后要删，合并进精简文件还要用它
+        new_msgs: list = []
+        try:
+            _d = _json.loads(part.read_text(encoding="utf-8"))
+            if isinstance(_d.get("messages"), list):
+                new_msgs = [m for m in _d["messages"] if isinstance(m, dict)]
+        except (OSError, ValueError, UnicodeDecodeError):
+            new_msgs = []
         try:
             total, added = paths.merge_export_json(target, part)
         except (ValueError, OSError) as e:
@@ -2255,6 +2387,15 @@ class MainWindow(QMainWindow):
         if existed:
             self.content.log.sys(
                 f"[导出] 已与既有消息 json 合并：共 {total} 条，本次新增 {added} 条")
+        # 同步合并进精简文件（按 id 去重 + 重复文字保留首末），浏览时立刻能看到
+        if new_msgs:
+            try:
+                from .msg_cache import merge_into_slim
+                n_slim = merge_into_slim(target, new_msgs)
+            except Exception:                                   # noqa: BLE001
+                n_slim = -1
+            if n_slim >= 0:
+                self.content.log.sys(f"[导出] 精简文件已同步合并去重：共 {n_slim} 条")
 
     def _export_done_ok(self) -> None:
         self.content.action_bar.set_running(False)
@@ -2333,6 +2474,18 @@ class MainWindow(QMainWindow):
             stats.begin_run()                    # 下载统计：复位增量基准（按实际时间分账）
         self._load_id_pool(argv)                 # 有下载源 JSON 时登记完整消息号
 
+    def _on_mirror_closed(self) -> None:
+        """「tdl 窗口」被用户点 X 关掉：同步按钮文案与设置（记成「关」），
+        避免下次命令又弹回来。
+
+        ⚠️ 按钮 `_btn_mirror` 挂在 `Content` 上（标题栏那一行），所以这里要经由
+        `self.content` 去改 —— 本方法是 `MainWindow` 的方法（runner 的信号连到这）。
+        """
+        try:
+            self.content.set_mirror_state(False)
+        except Exception:                        # noqa: BLE001
+            pass
+
     def _load_id_pool(self, argv: list) -> None:
         """下载命令带 -f/--file（下载源 JSON）时，读出里面的完整消息号与文件名。
 
@@ -2369,17 +2522,22 @@ class MainWindow(QMainWindow):
         self.task_box.set_download_dir(dl_dir)
         self.task_box.set_id_pool(paths.sort_id_pool(pool, desc), files, restart)
 
-    def _on_out(self, line: str) -> None:
+    def _on_out(self, lines) -> None:
         # ⚠️ 这里必须兜住异常：本方法是 Qt 信号槽，抛出的异常不会中断程序，
         # 只会被 Qt 吞掉并**静默终止**这条输出流 —— 表现就是「任务进度、网速、
         # 下载量全部停更，界面上看不出任何错误」。曾因 TaskBox 缺接口踩过一次。
-        try:
-            self._handle_out(line)
-        except Exception as e:                       # noqa: BLE001
-            self._out_errors += 1
-            if self._out_errors <= 3:                # 只报前几次，避免刷屏
-                self.content.log.err(
-                    f"[进度解析异常] {type(e).__name__}: {e}")
+        # ⚠️⚠️ **参数名必须和下面用的一致**（v2.10.11 修）：2.10.9 把载荷从 `str` 改成
+        #    `list` 时只改了函数体、忘了改形参，于是**每一行输出都在这里 NameError**
+        #    并被 Qt 槽吞掉 → 任务卡一个都不建、网速永不刷新（用户报「任务进度界面无显示」）。
+        #    教训：**改信号载荷类型时，接收槽的「形参名」和「函数体」要一起看**。
+        for line in (lines if isinstance(lines, list) else [lines]):
+            try:
+                self._handle_out(line)
+            except Exception as e:                   # noqa: BLE001
+                self._out_errors += 1
+                if self._out_errors <= 3:            # 只报前几次，避免刷屏
+                    self.content.log.err(
+                        f"[进度解析异常] {type(e).__name__}: {e}")
 
     def _handle_out(self, line: str) -> None:
         if self._export_stage == "ls":
@@ -2429,8 +2587,9 @@ class MainWindow(QMainWindow):
         if self._run_kind == "dl":
             stats.add_progress(total_bytes, task_count)
 
-    def _on_err(self, line: str) -> None:
-        self.content.log.err(strip_ansi(line))
+    def _on_err(self, lines) -> None:
+        for line in (lines if isinstance(lines, list) else [lines]):
+            self.content.log.err(strip_ansi(line))
 
     def _on_finished(self, rec) -> None:
         if self._export_stage:

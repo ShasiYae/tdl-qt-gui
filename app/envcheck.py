@@ -132,9 +132,10 @@ def resolve_tdl_path() -> str:
 
         ① 环境变量 TDL_EXE（显式覆盖，最高优先）
         ② 部署助手导出的 deploy-state.json
-        ③ 本软件目录下的 tdl.exe（绿色便携）
-        ④ 系统 PATH
-        ⑤ 常见位置兜底
+        ③ **内置引擎**：软件目录下的 bin\tdl.exe（自己编译的，见 paths.engine_exe）
+        ④ 本软件目录下的 tdl.exe（绿色便携）
+        ⑤ 系统 PATH
+        ⑥ 常见位置兜底
 
     全部找不到时返回空串，由调用方决定怎么提示。
     """
@@ -145,6 +146,12 @@ def resolve_tdl_path() -> str:
     from_state = _from_deploy_state()
     if from_state:
         return from_state
+
+    # 内置引擎：软件目录下的 bin\tdl.exe —— **用户自己编译的那份**，优先于
+    # 绿色便携（app_root\tdl.exe）与系统 PATH（PATH 里有 D:\bin\tdl.exe）
+    eng = paths.engine_exe()
+    if eng.is_file():
+        return str(eng)
 
     local = paths.app_root() / ("tdl.exe" if os.name == "nt" else "tdl")
     if local.is_file():

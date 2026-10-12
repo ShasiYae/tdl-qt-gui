@@ -701,7 +701,7 @@ class TaskPanel(QWidget):
 
         顺序 = **池顺序**（池已由 paths.sort_id_pool 排成 tdl 的实际下载顺序），
         取第一个「未被占用 **且磁盘上还没有最终文件**」的号：
-          · 完整序号（≥5 位且在池中）→ 直接用它（tdl 用的就是这个号）
+          · 完整序号（≥5 位纯数字）→ 直接采信 tdl 给的号（不再要求在池中）
           · 前缀命中 → 按池顺序取第一个可用
           · 前缀没线索（连前几位都被切掉）→ 同样按池顺序取
         ⚠️ 必须跳过「磁盘上已经下载完成」的号：tdl 的 --skip-same（GUI 默认开启）
@@ -718,9 +718,9 @@ class TaskPanel(QWidget):
         def usable(i: str) -> bool:
             return i not in self._mid_used and i not in skip
 
-        if mid and len(mid) >= 5 and mid in self._id_pool:
+        if mid and len(mid) >= 5 and mid.isdigit():
             self._mid_used.add(mid)
-            return mid                              # 本来就是完整的
+            return mid                              # tdl 给的完整号：直接采信（直映射）
         if mid:
             for i in self._id_pool:                 # 池顺序 = tdl 的产出顺序
                 if i.startswith(mid) and usable(i):
@@ -808,6 +808,19 @@ class TaskPanel(QWidget):
             return ordered + sorted(ids - set(ordered), key=int)
         return sorted(ids, key=int)
 
+    def _mids_complete(self, rows: list) -> bool:
+        """tdl 行自带的消息号是否**个个完整**（群号 + ≥5 位纯数字号）。
+
+        完整时身份直接取 tdl 行（`_new_key` 原样采用），磁盘 `.tmp` 位置锚定
+        不再插手 —— 这是「卡片与 tdl 输出一致」的前提（见 commit_round ⓪）。
+        """
+        for a in rows:
+            gid = str(a.get("gid") or "").strip()
+            mid = str(a.get("mid") or "").strip()
+            if not gid or len(mid) < 5 or not mid.isdigit():
+                return False
+        return True
+
     def commit_round(self) -> None:
         """一轮渲染结束：把本轮的活跃行映射到稳定身份，然后刷新卡片。"""
         active, done = self._round_active, self._round_done
@@ -822,15 +835,19 @@ class TaskPanel(QWidget):
         claimed: set[str] = set()
 
         # ---- ① 活跃行认领身份 ----
-        # ⓪ 磁盘锚定（最高优先级，下载卡专用）：下载中的文件在磁盘上就是
-        #   `<群号>_<消息号>_<文件名>.tmp`（tdl 的 OnDone 才改名）。此刻磁盘上
-        #   存在的 .tmp 集合 = tdl 此刻真正在下的任务集合 —— 号完整、零猜测，
-        #   比池序/字节启发式都硬。行数吻合时按位置锚定：第 i 行 ↔ 池序第 i 个
-        #   活跃 .tmp（池已按 tdl 的 sortDialogs 顺序排好）。
-        #   完成卡则**直接沿用这里定下的身份**（用户要求：完成后不做检测）。
+        # ⓪ 磁盘锚定（**只做兜底**）：tdl 的进度行本来就带 `群名(群号):消息号`，
+        #   群名不长时消息号**总是完整的** —— 此时直接用 tdl 给的号当身份
+        #   （_new_key 对完整号原样采用），与 tdl 输出逐字一致。
+        #   只有 tdl 的号**缺失/被截断**时才退回磁盘 `.tmp` 位置锚定：
+        #   `<群号>_<消息号>_<文件名>.tmp`（OnDone 才改名），此刻磁盘上的 tmp 集合
+        #   = tdl 正在下的任务集合 —— 但它可能混入**残骸/预创建**的 tmp，行数碰巧
+        #   吻合时按位置一错就整张卡带偏（实测 tdl 在下 70297、卡片标 70295）。
+        #   所以：tdl 有号信 tdl，磁盘只救「号被切掉」的场景。
+        #   完成卡则**直接沿用下载阶段定下的身份**（用户要求：完成后不做检测）。
         disk_mids = self._tmp_mids()
         anchored = False
-        if disk_mids and len(disk_mids) == len(active):
+        if disk_mids and len(disk_mids) == len(active) \
+                and not self._mids_complete(active):
             gid = next((str(a.get("gid") or "").strip() for a in active
                         if str(a.get("gid") or "").strip()), "")
             if gid:
@@ -1019,6 +1036,11 @@ class TaskPanel(QWidget):
                 best, best_v = i, v
         return best
 
+    # ---- 实时速率（已移除）------------------------------------------------
+    # v2.13.0 起，卡片数值**直映射 tdl 输出行**：速度就是 tdl 行里的速率串，
+    # 不再自己按「字节增量 ÷ 时间增量」另算一套（那套曾让同一任务在卡片和
+    # tdl 窗口里显示不同的速度，还会在停滞 2 秒后显示 0 B/s 造成"卡死了"的错觉）。
+
     def _touch_card(self, key: str, info: dict) -> None:
         """按身份更新（不存在则新建）卡片。
 
@@ -1060,6 +1082,11 @@ class TaskPanel(QWidget):
             card.gid = g
             card.mid = m
             card.fname = self._file_of(m)
+        # 已下载字节：直取 tdl 行（供摘要统计与完成行定位用）
+        if info.get("bytes") is not None:
+            self._bytes_by_key[key] = int(info["bytes"])
+        # 进度 / 已下载 / 速度 / 已用：**直映射 tdl 输出行**，与「tdl 窗口」
+        # 镜像里看到的内容一致（速度就是 tdl 行里的速率串，口径与它相同）
         card.update_progress(info.get("pct"), info.get("val"), info.get("rate"),
                              info.get("elapsed"), state)
         if state != card.state:
@@ -1068,9 +1095,8 @@ class TaskPanel(QWidget):
             elif state == "running":
                 self._running_count += 1
             card.set_state(state)
-        if info.get("bytes") is not None:
-            self._bytes_by_key[key] = int(info["bytes"])
-        # 进行中的任务：记录**实时速率**（状态栏网速就是它们之和）
+        # 进行中的任务：速率表存 tdl 行里的速率（状态栏网速 = 各卡 tdl 速率之和，
+        # 与卡片显示同口径）
         self._rate_by_key[key] = parse_rate(info.get("rate"))
         self._refresh_summary()
 
@@ -1097,7 +1123,7 @@ class TaskPanel(QWidget):
         card.set_compact()                      # 用卡片既有 gid/mid/fname + 最终大小
         if info.get("bytes") is not None:
             self._bytes_by_key[key] = int(info["bytes"])
-        # ⚠️ 完成的任务不再有「实时速率」—— 必须从速率表移除。原先这里把完成行报出的
+        # ⚠️ 完成的任务不再有速率 —— 必须从速率表移除。原先这里把完成行报出的
         #    平均速率写了进去、且从不清理，状态栏网速会把所有历史任务一路累加
         #    （用户实测「长时间运行会累计」）。下载量（bytes）则要保留，用于统计。
         self._rate_by_key.pop(key, None)
@@ -1113,7 +1139,7 @@ class TaskPanel(QWidget):
                 card.set_state("done" if ok else "stopped")
                 self._running_count -= 1
             card.set_compact()               # 命令已结束：全部收成单行（幂等）
-        self._rate_by_key.clear()            # 命令已结束 → 没有实时速率了（网速归零）
+        self._rate_by_key.clear()            # 命令已结束 → 没有速率了（网速归零）
         self._unseen.clear()
         self._prune_finished()
         self._refresh_summary()

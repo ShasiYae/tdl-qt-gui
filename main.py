@@ -297,6 +297,18 @@ def main() -> int:
     if "--probe" in sys.argv:
         return _probe()
 
+    # ---- 崩溃日志：越早装越好 ----
+    # pythonw 启动没有控制台 —— 未捕获异常 / Qt 致命错误 / C 层硬崩（访问违规）
+    # 全是无声的，表现就是「用着用着窗口没了」且什么都查不到。装完之后，
+    # 从这里往下的任何一步崩了都会落在 resources/logs/crash.log。
+    from app import crashlog
+    crashlog.install("tdl GUI")
+
+    # ⛔ 这里**故意不装** VEH（`app/nativecrash.py`）：10-11 实测，在 Qt 应用里让 VEH
+    # 跑 Python 回调会抢不到 GIL → **把"硬崩"变成"死锁"**（AppHang，日志一无所获，
+    # 比崩更难查）。定位崩溃改用 Windows 自带的两样：`%LOCALAPPDATA%\CrashDumps` 里的
+    # 转储 + 事件日志的「Application Error（错误模块名称/偏移量）」，见 nativecrash 模块头。
+
     # 资源目录结构（resources/json、resources/dl）——启动即建，幂等
     from app.paths import ensure_dirs
     ensure_dirs()
