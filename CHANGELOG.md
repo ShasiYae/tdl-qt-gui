@@ -234,7 +234,7 @@ Telegram 下载器 **tdl** 的图形客户端（PySide6 / Qt6）。
 
 【附：如何退回】
 
-- 旧版本的安装包已经留在本机（`C:\Users\Administrator\pyside_whl\6112\`），
+- 旧版本的安装包已经留在本机（6.11.2 的 whl 目录），
   一条命令即可退回：在工作目录运行 `_pyside_switch.py 6112`
   （新版本在 `612\`，`_pyside_switch.py 612` 可再换回来）。
 
