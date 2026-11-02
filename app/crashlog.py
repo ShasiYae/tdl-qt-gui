@@ -94,7 +94,6 @@ def _reopen() -> None:
 
 def _rotate_if_needed() -> None:
     """超过 MAX_BYTES 就轮转成 crash.log.1（只留一代）。"""
-    global _fh
     try:
         if _path is None or _fh is None or not _path.exists():
             return
@@ -204,7 +203,7 @@ def install_qt() -> bool:
         if _qt_handler is not None:
             return True
     try:
-        from PySide6.QtCore import QtMsgType, qInstallMessageHandler
+        from PySide6.QtCore import qInstallMessageHandler
     except Exception:                                     # noqa: BLE001
         return False
 

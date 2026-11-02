@@ -266,7 +266,7 @@ def _on_exception(ep) -> int:
         if code != EXCEPTION_STACK_OVERFLOW:
             frames = _backtrace()
             if frames:
-                lines.append(f"原生调用栈（真实栈；前几帧是记录器自己的调用链）：")
+                lines.append("原生调用栈（真实栈；前几帧是记录器自己的调用链）：")
                 lines += [f"    {x}" for x in frames]
 
         _raw_write("".join(f"[NATIVE] {ln}\n" for ln in lines) + "\n")

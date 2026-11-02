@@ -15,19 +15,17 @@
 """
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal, QSize, QTimer
 from PySide6.QtGui import QPainter, QColor, QPen, QFont, QFontMetrics
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QLineEdit,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QSpinBox, QComboBox, QPlainTextEdit, QPushButton, QCheckBox,
-    QFileDialog, QSizePolicy, QFrame, QScrollArea,
+    QFileDialog, QSizePolicy, QScrollArea,
 )
 
 from .theme import T
-from .icons import ICONS
 from .data import (
     FT_TEXT, FT_NUMBER, FT_SWITCH, FT_SELECT, FT_PATH,
     FT_MULTI, FT_PASSWORD, FT_LIST, FT_NOTE,
@@ -164,7 +162,6 @@ class Segmented(QWidget):
 
         f = self._font()
         p.setFont(f)
-        fm = QFontMetrics(f)
 
         for x, w, i in self._rects:
             o = self._opts[i]

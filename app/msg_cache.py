@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
 from pathlib import Path
 
 from . import paths
@@ -121,8 +122,7 @@ def load_messages(path: str | Path) -> tuple[list[dict], str, dict]:
             "messages": clean,
         }
         try:
-            slim.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-            written = slim
+            written = slim if _write_slim(slim, payload) else None
         except OSError:
             written = None                           # 写不了就只影响速度，不影响使用
     else:
@@ -130,6 +130,26 @@ def load_messages(path: str | Path) -> tuple[list[dict], str, dict]:
         drop_cache(src)
 
     return clean, chat_id, {"from_cache": False, "removed": removed, "slim": written}
+
+
+def _write_slim(slim: Path, payload: dict) -> bool:
+    """原子写精简文件（临时文件 + os.replace）。
+
+    ⚠️ 不能直接 `write_text` 覆盖（v2.13.8 修）：精简文件是缓存，但**写一半崩掉
+    就是一个损坏的 json** —— 下次打开会解析失败、退回全量重算（慢），
+    而且用户看不到任何提示。用同目录临时文件 + rename 保证「要么旧要么新」。
+    """
+    tmp = slim.with_name(slim.name + ".writing")
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, slim)
+        return True
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return False
 
 
 def drop_cache(path: str | Path) -> bool:
@@ -145,33 +165,40 @@ def drop_cache(path: str | Path) -> bool:
 def _merge_by_id(old: list, new: list) -> list[dict]:
     """按消息 id 合并两个列表：同 id 以 **new** 为准，结果按 id 升序。
 
-    没有 id（或 id 不是整数）的消息原样保留在末尾，不参与去重。
+    ⚠️ 没有 id 的消息用**内容指纹**判重（v2.13.8 修）：
+      之前这里 `k is None → continue`，把**旧的**无 id 消息**全丢了**；
+      另一条路径（`paths.merge_export_json`）又反过来会累积重复。
+      现在两处统一用 `msg_dedup.msg_fingerprint`：既不丢，也不膨胀。
     """
+    from .msg_dedup import msg_fingerprint
+
     def _key(m: dict):
         try:
-            return int(m.get("id"))
+            k = int(m.get("id"))
+            return ("i", k)
         except (TypeError, ValueError):
-            return None
+            return ("f", msg_fingerprint(m))
 
     out: dict = {}
-    tail: list[dict] = []
-    for m in new:                       # 先放新的：同 id 时由它占住坑
+    tail_keys: list = []
+    for m in new:                       # 先放新的：同键时由它占住坑
         if not isinstance(m, dict):
             continue
         k = _key(m)
-        if k is None:
-            tail.append(m)
-        else:
-            out[k] = m
-    for m in old:                       # 再补旧的：同 id 已被新的占了就跳过
+        if k[0] != "i":
+            tail_keys.append(k)
+        out[k] = m
+    for m in old:                       # 再补旧的：同键已被新的占了就跳过
         if not isinstance(m, dict):
             continue
         k = _key(m)
-        if k is None:
-            continue
+        if k not in out and k[0] != "i":
+            tail_keys.append(k)
         out.setdefault(k, m)
-    merged = [out[k] for k in sorted(out)]
-    merged.extend(tail)
+    with_id = sorted((k for k in out if k[0] == "i"), key=lambda t: t[1])
+    merged = [out[k] for k in with_id]
+    merged.extend(out[k] for k in dict.fromkeys(tail_keys))   # 去重且保序
+    return merged
     return merged
 
 
@@ -222,8 +249,6 @@ def merge_into_slim(src: str | Path, new_msgs: list[dict]) -> int:
         "id": chat_id,
         "messages": [_keep_fields(m) for m in kept],
     }
-    try:
-        slim.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    except OSError:
+    if not _write_slim(slim, payload):
         return -1
     return len(kept)

@@ -16,11 +16,11 @@ import os
 import threading
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QSize, QTimer, Signal, QPoint, QEvent
+from PySide6.QtCore import Qt, QTimer, Signal, QPoint, QEvent
 from PySide6.QtGui import QPainter, QColor, QPen, QFont, QFontMetrics, QPolygon
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QScrollArea, QFrame, QSizePolicy, QSplitter, QToolButton, QPushButton,
+    QScrollArea, QFrame, QSplitter, QToolButton, QPushButton,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
     QInputDialog, QMenu, QLineEdit, QComboBox, QCheckBox, QTextBrowser,
     QSystemTrayIcon, QApplication, QMessageBox,
@@ -31,8 +31,8 @@ from .theme import T
 from .version import __version__
 from .icons import ICONS
 from .data import (
-    NAV_GROUPS, CMD_BY_ID, COMMANDS, GLOBAL_CARDS, DEFAULT_TDL_PATH,
-    global_args_fields, dl_param_fields, GLOBAL_FIELDS,
+    NAV_GROUPS, CMD_BY_ID, GLOBAL_CARDS, DEFAULT_TDL_PATH,
+    global_args_fields, GLOBAL_FIELDS,
 )
 from . import paths
 from . import envcheck
@@ -105,7 +105,7 @@ def _export_lookup_error(key: str, chats: list, ls_lines: list) -> tuple[str, li
     return "群组未找到", [
         f"[导出失败] 会话列表里没有匹配「{key}」的群组。",
         f"  实际可用{more}：{brief}",
-        "  可填：@用户名、纯群号（如 2305571652）、完整 id（-100…）或群名。",
+        "  可填：@用户名、纯群号（如 1000000001）、完整 id（-100…）或群名。",
     ]
 
 
@@ -1362,7 +1362,6 @@ class MainWindow(QMainWindow):
         ui = self._deploy_ui = {}
         self._deploy_buttons = []
         form = self.content.form_layout
-        d = paths.app_root()
 
         # ── ① 环境状态 ──
         gb = GroupBox("环境状态")
@@ -1914,7 +1913,6 @@ class MainWindow(QMainWindow):
           resources/dl/<群号 或 username>/
         源值没变就绝不动目录，避免覆盖用户手动修改的下载目录。
         """
-        import os as _os
         c = self.current_cmd
         if not c or c.get("id") != "dl" or self._cur_form is None:
             return
@@ -1936,7 +1934,7 @@ class MainWindow(QMainWindow):
             if not tag:
                 return                           # 解析不出（清空/tg://）：保持现状
             self._anchor_dl_dir_to(str(paths.dl_root() / tag),
-                                   f"[锚定] 下载目录已跟随消息链接 → ")
+                                   "[锚定] 下载目录已跟随消息链接 → ")
             return
 
         if mode != "json":

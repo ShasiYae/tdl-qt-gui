@@ -123,7 +123,7 @@ _RE_TG_U = re.compile(
 def tg_chat_tag(url: str) -> str:
     """从 Telegram 消息链接里取「群组标识」（用于自动生成下载子目录）。
 
-    · 私有群/频道  https://t.me/c/1539539150/95292  → `1539539150`（链接里的群号）
+    · 私有群/频道  https://t.me/c/1234567890/12345  → `1234567890`（链接里的群号）
     · 公开群/频道  https://t.me/example_group/123 → `example_group`
       （公开链接里没有数字群号，直接沿用 username 创建文件夹 —— 纯英文，
         与命名规则兼容，也不必异步去查会话换算 ID）
@@ -209,22 +209,54 @@ def merge_export_json(target, incoming) -> tuple[int, int]:
     old = _read(target)
     old_data, old_msgs = (old if old else ({}, []))
 
-    def _key(m: dict):
-        try:
-            return (0, int(m.get("id")))
-        except (TypeError, ValueError):
-            return (1, 0)                     # 非数字 id 排最后
+    def _norm_id(m: dict):
+        """取出可比较的数字 id；取不到返回 None。
 
-    by_id: dict[str, dict] = {}
-    for m in old_msgs:
-        by_id[str(m.get("id"))] = m
+        ⚠️ 注意区分 `0` 与 `None`：`id: 0` 是合法值，不能当成「没有 id」。
+        """
+        raw = m.get("id")
+        if isinstance(raw, bool):                 # bool 是 int 子类，先排掉
+            return None
+        if isinstance(raw, int):
+            return raw
+        if isinstance(raw, str) and raw.strip().isdigit():
+            try:
+                return int(raw.strip())
+            except ValueError:
+                return None
+        return None
+
+    # ⚠️⚠️ 无 id 的消息处理（v2.13.8 定稿，前两版都错过）：
+    #   · 2.13.6 之前：`str(m.get("id"))` 当键 → 无 id 的键全是 "None" → **互相覆盖**，
+    #     多条被压成一条（丢数据）。
+    #   · 2.13.6：改成独立列表原样追加 → **重复导出一遍就多一份**（实测 2 条 → 6 条）。
+    #   · 现在：用**内容指纹**判重（`msg_dedup.msg_fingerprint`）—— 既不丢也不膨胀。
+    from .msg_dedup import msg_fingerprint
+
+    by_key: dict[tuple, dict] = {}                # ("i", id) 或 ("f", 指纹)
+
+    def _key_of(m: dict) -> tuple:
+        k = _norm_id(m)
+        return ("i", k) if k is not None else ("f", msg_fingerprint(m))
+
+    def _put(m: dict, *, count_new: bool) -> bool:
+        """放入一个消息；返回它是否是「新出现的键」。"""
+        k = _key_of(m)
+        is_new = k not in by_key
+        by_key[k] = m                             # 同键：后来的为准
+        return is_new and count_new
+
     added = 0
+    for m in old_msgs:
+        _put(m, count_new=False)
     for m in inc_msgs:
-        k = str(m.get("id"))
-        if k not in by_id:
+        if _put(m, count_new=True):
             added += 1
-        by_id[k] = m                          # 同 id：本次为准
-    merged = sorted(by_id.values(), key=_key)
+
+    # 排序：有数字 id 的按 id 升序在前；无 id 的接在后面（保持插入顺序）
+    with_id = sorted((k for k in by_key if k[0] == "i"), key=lambda t: t[1])
+    no_id = [k for k in by_key if k[0] != "i"]
+    merged = [by_key[k] for k in with_id] + [by_key[k] for k in no_id]
 
     data = dict(old_data) if isinstance(old_data, dict) else {}
     if isinstance(inc_data, dict):
@@ -245,10 +277,10 @@ def find_chat(chats: list[dict], key: str) -> dict | None:
 
     用户实际会填的形态都要认：
       · `@username` / `username`
-      · 纯群号 `2305571652` —— 实测 tdl 给的 id 就是这个形态
-        （`resources/json/<缩写>-<群号>.json` 里 `{"id":2305571652}`），
+      · 纯群号 `1000000001` —— 实测 tdl 给的 id 就是这个形态
+        （`resources/json/<缩写>-<群号>.json` 里 `{"id":1000000001}`），
         用户多半也是从这类文件名里抄的
-      · `-1002305571652` / `-2305571652` —— 私有超级群的另一种写法，
+      · `-1001000000001` / `-1000000001` —— 私有超级群的另一种写法，
         tdl 有些路径会这么给（本文件 `chat_no()` 即为此而写）
       · 群名（精确匹配，用户图省事直接贴群名时）
     """
@@ -267,8 +299,8 @@ def find_chat(chats: list[dict], key: str) -> dict | None:
             return c
     # ③ 群号宽松匹配 —— 把 id 归一化成「所有可能的纯群号」再取交集。
     #    为什么是集合：tdl 给的形态不止一种 ——
-    #    实测 `chat ls` / 导出 json 里是**纯数字** `2305571652`，
-    #    但私有超级群也可能是 `-1002305571652`（本文件 `chat_no()` 就是为后者写的）。
+    #    实测 `chat ls` / 导出 json 里是**纯数字** `1000000001`，
+    #    但私有超级群也可能是 `-1001000000001`（本文件 `chat_no()` 就是为后者写的）。
     #    而用户从**导出文件名**里抄到的永远是纯数字那一种。两边都归一化才不会有漏。
     def _nums(v) -> set:
         s = str(v or "").strip()
@@ -326,7 +358,7 @@ def export_id_files(path) -> dict:
 
     为什么要它：
       · 进度行的 message 被 tdl 截断到 30 字符，群名一长 `(群号):消息号` 就被切掉，
-        序号只剩前几位（如 1759495254 → 175）；完整 ID 只能从下载源里取。
+        序号只剩前几位（如 1234567890 → 175）；完整 ID 只能从下载源里取。
       · 进度行里**根本没有文件扩展名**，而用户要看「这是 jpg 还是 mp4」，
         也只能从下载源的文件名里取。
 

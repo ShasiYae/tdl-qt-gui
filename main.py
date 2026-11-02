@@ -37,7 +37,7 @@ def _probe() -> int:
                 pass
 
     from PySide6.QtWidgets import QApplication
-    from app.theme import T, QSS
+    from app.theme import T
     from app.icons import ICON_PATHS, icon_path, app_icon, APP_ICON_SIZES
     from app.data import (
         COMMANDS, CMD_BY_ID, NAV_GROUPS, GLOBAL_FIELDS,
@@ -133,10 +133,11 @@ def _probe() -> int:
        f"全部 flag 均存在于 tdl v0.20.4（越界项：{bad_flags or '无'}）")
 
     # --- 控件构造 ---
-    app = QApplication.instance() or QApplication(sys.argv)
+    # 必须先建 QApplication（控件构造需要），但下面并不直接用到这个变量
+    QApplication.instance() or QApplication(sys.argv)
     try:
-        from app.widgets import HubTab, SubTab, SubTabBar, NavItem, GroupBox
-        from app.form_renderer import Segmented, FieldRow, FormRenderer
+        from app.widgets import HubTab, SubTab, NavItem
+        from app.form_renderer import Segmented
         from app.log_panel import LogPanel, ActionBar
         from app.runner import build_argv, LineBuffer, strip_ansi, split_flag
 
@@ -182,7 +183,7 @@ def _probe() -> int:
             {"__ns": "default", "__threads": 4, "__limit": 2, "__pool": 8,
              "__delay": "0", "__ntp": "", "__reconn": "5m"},
         )
-        ok(argv[0] == "download", f"下载命令首词 = download")
+        ok(argv[0] == "download", "下载命令首词 = download")
         ok(argv.count("--url") == 2, "多条 --url 正确展开")
         ok("--group" in argv, "布尔开关正确生成")
         ok("--continue" not in argv, "False 开关不生成")

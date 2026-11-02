@@ -168,8 +168,6 @@ class TdlRunner(QObject):
         self._record: RunRecord | None = None
         self._out_buf = LineBuffer()
         self._err_buf = LineBuffer()
-        self._pending: list[list[str]] = []   # 命令队列（备用）
-        self._queue_total = 1
         # 「tdl 窗口」镜像（测试/验证用）：把收到的原始输出**再打一份**到独立控制台
         # 窗口，这样界面里的卡片与 tdl 原本那套进度条能同时看到（见 app/console_mirror.py）。
         # None = 没开（默认）。开关在「运行输出」标题栏的复选框。
@@ -444,15 +442,6 @@ class TdlRunner(QObject):
             self._close_mirror()
         self.finished_.emit(rec)
 
-        # 队列接续（备用）：前一条成功才跑下一条
-        if self._pending and rec is not None and rec.exit_code == 0:
-            nxt = self._pending.pop(0)
-            done = self._queue_total - len(self._pending)
-            self.line_err.emit([f"[队列] {done}/{self._queue_total} 完成，继续下一条…"])
-            self.start(nxt)
-        else:
-            self._pending = []
-
     # ---------------------------------------------------------------- 终止
     @staticmethod
     def _taskkill_tree(pid: int) -> None:
@@ -475,7 +464,6 @@ class TdlRunner(QObject):
         账号数据库锁。所以先 `proc.kill()`（Windows 下是 TerminateProcess，同步
         可靠），确认没死再用 taskkill 收进程树兜底。
         """
-        self._pending = []            # 终止 = 放弃整个队列/流程
         proc = self._proc
         if proc is None or proc.poll() is not None:
             # 进程已死但 UI 还在 running 态（竞态兜底）——手动复位
@@ -511,7 +499,6 @@ class TdlRunner(QObject):
         只结束**本实例自己启动的**那个子进程，不碰用户可能在终端里另起的 tdl
         （不同 --ns 用的是不同库文件，本可以并行）。
         """
-        self._pending = []
         self._close_mirror()
         proc, self._proc = self._proc, None
         if proc is None:
@@ -533,17 +520,7 @@ class TdlRunner(QObject):
         left = [] if proc.poll() is not None else [pid]
         return (not left), left
 
-    # ---------------------------------------------------------------- 队列
-    def start_queue(self, argv_list: list[list[str]]) -> bool:
-        """按顺序执行多条命令（前一条成功才跑下一条；任一失败即终止队列）。"""
-        if not argv_list:
-            return False
-        if self.running:
-            return False
-        self._pending = [list(a) for a in argv_list[1:]]
-        self._queue_total = len(argv_list)
-        return self.start(argv_list[0])
-
+    # ---------------------------------------------------------------- 其它
     def line_sys(self, text: str) -> None:
         """系统提示行（走 err 通道简化处理）。"""
         self.line_err.emit([text])

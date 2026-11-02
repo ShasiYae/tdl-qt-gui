@@ -15,11 +15,28 @@ from __future__ import annotations
 
 import difflib
 import functools
+import hashlib
+import json
 import re
 
 FUZZY_RATIO = 0.90                 # 「近似文字」相似度阈值（越大越严格）
 FUZZY_MIN_LEN = 3                  # 短于此长度的文本不做近似匹配（防误合并）
 _WS = re.compile(r"\s+")
+
+
+def msg_fingerprint(m: dict) -> str:
+    """消息的**内容指纹**（不含 id）：给「没有 id 的消息」判重用。
+
+    为什么需要：合并导出时，正常消息靠 id 去重；但有些记录没有 id，
+    既不能丢（2.13.6 前的老 bug），也不能无限累积（2.13.6 引入的反向 bug ——
+    同一批重复导出 N 次就存 N 份）。用内容指纹判重可同时满足两者。
+
+    ⚠️ 取舍：内容**完全一样**的两条真消息会被合并成一条。本项目里 tdl 导出的
+    消息都带 id，走到这个分支的已属异常数据，可接受。
+    """
+    body = {k: v for k, v in m.items() if k != "id"}
+    raw = json.dumps(body, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()
 
 
 def plain_key(m: dict) -> str | None:

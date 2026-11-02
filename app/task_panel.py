@@ -28,7 +28,6 @@ from PySide6.QtWidgets import (
     QProgressBar, QScrollArea, QToolButton, QMenu,
 )
 
-from .theme import T
 from .widgets import hand_cursor
 
 # ---- 解析：尾部 "<value> in <elapsed>; <rate>" ----
@@ -617,7 +616,10 @@ class TaskPanel(QWidget):
         self._file_map: dict[str, str] = {}        # 消息号 → 文件名（含扩展名）
         self._dl_dir = ""                          # 下载目录（.tmp 锚定 / 已下载号排除用）
         self._restart = False                      # --restart：tdl 重下全部（不做已存在排除）
-        self._done_mids: set[str] = set()          # 磁盘上「已下载完成」的消息号（每轮刷新）
+        self._done_mids: set[str] = set()          # 磁盘上「已下载完成」的消息号（按目录 stat 缓存）
+        # 上面那个缓存的失效判据 (目录 st_mtime_ns, st_size)；None = 还没算过。
+        # ⚠️ commit_round 每秒跑 10 次，未缓存时每次都要列举 2 万个文件名（19 ms）。
+        self._done_mids_sig: tuple | None = None
         # 本次运行累计进度回调 `fn(total_bytes, task_count)` —— 下载统计据此
         # **按实际发生的时间**分账（见 stats.add_progress）；None 时不做任何事。
         self._progress_hook = None          # 磁盘上「已下载完成」的消息号（每轮刷新）
@@ -648,6 +650,7 @@ class TaskPanel(QWidget):
         self._uid = 0
         self._mid_used.clear()
         self._done_mids = set()
+        self._done_mids_sig = None
         self._card_order = []
         self._summary.setText("共 0 个任务")
 
@@ -690,7 +693,14 @@ class TaskPanel(QWidget):
           · 下载卡身份：扫 `*.tmp`（`群号_消息号_文件名.tmp`，OnDone 才改名）
           · 池序分派排除：扫已有最终文件的号（tdl 的 --skip-same / 续传会跳过）
         """
-        self._dl_dir = str(d or "").strip()
+        new_dir = str(d or "").strip()
+        if new_dir != self._dl_dir:
+            # ⚠️ 换目录必须让缓存失效：`_done_mids_sig` 是**目录自身的 stat 签名**，
+            # 若新目录的 (mtime_ns, size) 与旧目录恰好相同（极低概率），就会拿到
+            # 旧目录的结果 —— 卡片会把「别的目录里已下好的号」当成已完成跳过。
+            self._done_mids_sig = None
+            self._done_mids = set()
+        self._dl_dir = new_dir
 
     def _file_of(self, mid) -> str:
         """消息号对应的文件名（含扩展名，如 `IMG_1542.MOV`）；取不到返回空串。"""
@@ -713,14 +723,20 @@ class TaskPanel(QWidget):
         mid = str(mid or "").strip()
         if not self._id_pool:
             return mid
-        skip = self._done_mids if not self._restart else set()
+        # ⚠️⚠️ **完整号直接采信，这里必须「先返回」**（v2.13.9）：
+        #   tdl 的进度行绝大多数都带完整号（`群名(群号):12345`），这条分支
+        #   根本用不到「磁盘上已下载了哪些号」。原来的写法把 `skip` 算在返回之前，
+        #   导致**每秒 10 次**去扫一遍下载目录（上万条目 × 19ms），纯浪费。
+        if mid and len(mid) >= 5 and mid.isdigit():
+            self._mid_used.add(mid)
+            return mid                              # tdl 给的完整号：直接采信（直映射）
+
+        # 只有走到这里（号被截断、要按池序还原）才需要磁盘真值。
+        skip = set() if self._restart else self._done_mids_now()
 
         def usable(i: str) -> bool:
             return i not in self._mid_used and i not in skip
 
-        if mid and len(mid) >= 5 and mid.isdigit():
-            self._mid_used.add(mid)
-            return mid                              # tdl 给的完整号：直接采信（直映射）
         if mid:
             for i in self._id_pool:                 # 池顺序 = tdl 的产出顺序
                 if i.startswith(mid) and usable(i):
@@ -732,26 +748,55 @@ class TaskPanel(QWidget):
                 return i
         return mid                                  # 池已用尽 / 对不上 → 原样
 
+    def _done_mids_now(self) -> set:
+        """按需取「磁盘上已下载完成」的号（内部有目录 stat 缓存）。
+
+        ⚠️ 只在 `_pick_full_id` 需要按池序还原时才调用 —— 不要放回
+        `commit_round` 里每轮无条件执行。
+        """
+        self._done_mids = self._scan_done_mids()
+        return self._done_mids
+
     def _scan_done_mids(self) -> set:
         """下载目录里**已经下载完成**（最终名已落盘、非 .tmp）的消息号。
 
         池序分派（回退路径）要跳过这些号：tdl 的 --skip-same（GUI 默认开启）
         与 --continue 续传都会跳过它们。磁盘上「最终名」= OnDone 已改名，
         对应 tdl 的 `--skip-same` 检查（同名同大小）与 resume 的已完成记录。
+
+        ⚠️⚠️ **必须用目录 stat 做缓存**（v2.13.6 修）：本方法由 `commit_round()`
+        调用，而 `commit_round()` 在**每条轮次分隔行**上执行 —— tdl 每 0.1 秒一轮，
+        即**每秒 10 次**。实测 28,303 个文件的目录，光 `os.scandir` 列举就要
+        **19 ms**（`is_file()` 不是瓶颈，实测只差 1.8 ms；瓶颈是列举本身）
+        → 主线程 19% 的时间耗在重复遍历同一个目录上。
+
+        缓存判据 = **目录的 `st_mtime_ns`**（实测 `os.stat(目录)` 仅 **0.067 ms**，
+        比列举快 280 倍；新增文件后 mtime 必变，已实测验证）。
+        → 常态命中时本方法开销 **<0.1 ms**，未命中（真有新文件落盘）才重新列举。
         """
         if not self._dl_dir:
             return set()
+        try:
+            st = os.stat(self._dl_dir)
+            sig = (st.st_mtime_ns, st.st_size)   # size 兜底（极少数 fs 的 mtime 精度差）
+        except OSError:
+            return set()
+        if sig == self._done_mids_sig:
+            return self._done_mids               # ← 常态走这里：0.067 ms
+
         out: set[str] = set()
         try:
             with os.scandir(self._dl_dir) as it:
                 for e in it:
-                    if not e.is_file() or e.name.endswith(".tmp"):
+                    if e.name.endswith(".tmp"):
                         continue
                     m = re.match(r"^(\d+)_(\d+)_", e.name)
                     if m:
                         out.add(m.group(2))
         except OSError:
             return set()
+        self._done_mids_sig = sig
+        self._done_mids = out
         return out
 
     def push_row(self, info: dict) -> None:
@@ -822,17 +867,64 @@ class TaskPanel(QWidget):
         return True
 
     def commit_round(self) -> None:
-        """一轮渲染结束：把本轮的活跃行映射到稳定身份，然后刷新卡片。"""
+        """一轮渲染结束：把本轮的活跃行映射到稳定身份，然后刷新卡片。
+
+        ⚠️⚠️ **异常安全**（v2.13.6 修）：本方法由 `_handle_out` 在每条轮次分隔行上
+        调用，**每秒 10 次**。原来缓冲在开头就被清空，之后如果中段抛异常
+        （数据出现非预期类型 / `retitle` 拿到 None / `_pick_done` 边界…），
+        这一轮拿到的**全部进度行就永久丢失**，而且**收尾三步（定格/修剪/清幽灵卡）
+        也一起被跳过** → 卡片会越堆越多、该定格的永远停在「进行中」。
+        上层 `main_window._on_out` 的 `except Exception` 只能记一条日志救不回来。
+        所以现在：主体与收尾分开包，任一步失败都不影响另一步。
+        """
         active, done = self._round_active, self._round_done
         if not active and not done:
             return
+        # 先清空（防止本轮再进来的行被重复处理），但把它复制出来接着用
         self._round_active, self._round_done = [], []
-        # 磁盘真值：已下载完成（会被 tdl 的 --skip-same / 续传跳过）的号 ——
-        # 池序分派要绕过它们，否则每个任务都会提前一位（见 _pick_full_id）
-        self._done_mids = self._scan_done_mids()
+        claimed: set[str] = set()
+        try:
+            self._commit_round_body(active, done, claimed)
+        except Exception as e:                        # noqa: BLE001 - 进度面板不能拖垮下载
+            self._note_panel_error(e, len(active), len(done))
+        # 收尾：即使主体抛过异常也必须执行（否则僵尸卡/幽灵卡会堆积）
+        try:
+            # ⚠️ 每轮结束都要压一次上限：只挂在「有任务完成」的分支里是不够的 ——
+            # 某一轮如果只新增任务、没有完成的，卡片数会一路涨过上限。
+            # 卡住的进行中卡片先定格成「已终止」（否则它既不会被修剪也清不掉）
+            self._finalize_stale(claimed)
+            # _prune_finished 只动「已完成」的卡片，对进行中的无影响，无条件调用是安全的。
+            self._prune_finished()
+            # 兜底：不在 `_cards` 里的卡片控件一律收掉（漏过一次就会留点不掉的幽灵卡）
+            self._sweep_orphan_widgets()
+            self._reorder_cards()
+            # 上报本次运行累计进度 → 下载统计按**实际发生的时间**分账（跨零点分记两天）
+            self._emit_progress()
+        except Exception as e:                        # noqa: BLE001
+            self._note_panel_error(e, len(active), len(done), stage="收尾")
+
+    @staticmethod
+    def _note_panel_error(exc: BaseException, n_active: int, n_done: int,
+                          stage: str = "主体") -> None:
+        """把进度面板内部的异常记进 crash.log（界面不弹窗、日志能查到）。"""
+        try:
+            from . import crashlog
+            crashlog.note("PANEL", f"commit_round({stage}) 异常："
+                                   f"{type(exc).__name__}: {exc} "
+                                   f"（active={n_active} done={n_done}）")
+        except Exception:                             # noqa: BLE001
+            pass
+
+    def _commit_round_body(self, active: list, done: list, claimed: set) -> None:
+        """`commit_round()` 的实际处理体（外层已保证异常安全与收尾必执行）。"""
+        # ⚠️ **不要在这里扫磁盘**（v2.13.9）：本方法每秒被调 10 次，而「已下载完成
+        # 的号」只在 `_pick_full_id` 需要按池序还原时才用得上（完整号根本不看它）。
+        # 原来这里每轮无条件 `self._done_mids = self._scan_done_mids()` ——
+        # 即便加了目录 stat 缓存也要 0.067ms×10次/秒，且绝大多数轮次纯属白算。
+        # 现在由 `_done_mids_now()` 按需触发。
 
         live = self._live                 # [[key, 已下载字节], ...]，顺序 = 卡片顺序
-        claimed: set[str] = set()
+        # `claimed` 由调用方传入（收尾的 _finalize_stale 需要看到它）
 
         # ---- ① 活跃行认领身份 ----
         # ⓪ 磁盘锚定（**只做兜底**）：tdl 的进度行本来就带 `群名(群号):消息号`，
@@ -841,13 +933,19 @@ class TaskPanel(QWidget):
         #   只有 tdl 的号**缺失/被截断**时才退回磁盘 `.tmp` 位置锚定：
         #   `<群号>_<消息号>_<文件名>.tmp`（OnDone 才改名），此刻磁盘上的 tmp 集合
         #   = tdl 正在下的任务集合 —— 但它可能混入**残骸/预创建**的 tmp，行数碰巧
-        #   吻合时按位置一错就整张卡带偏（实测 tdl 在下 70297、卡片标 70295）。
+        #   吻合时按位置一错就整张卡带偏（实测 tdl 在下某一条、卡片标另一条）。
         #   所以：tdl 有号信 tdl，磁盘只救「号被切掉」的场景。
         #   完成卡则**直接沿用下载阶段定下的身份**（用户要求：完成后不做检测）。
-        disk_mids = self._tmp_mids()
+        #
+        # ⚠️⚠️ **懒计算**（v2.13.6 修）：`_tmp_mids()` 要列举整个下载目录
+        #   （实测上万条目 **17.5 ms**），而 `commit_round()` 每秒跑 10 次 ——
+        #   绝大多数轮次 tdl 给的号都是完整的、根本走不到磁盘锚定，此时白扫
+        #   等于每秒往主线程扔 175 ms。所以先判断需不需要，再决定扫不扫。
+        disk_mids: list = []
         anchored = False
-        if disk_mids and len(disk_mids) == len(active) \
-                and not self._mids_complete(active):
+        if not self._mids_complete(active):
+            disk_mids = self._tmp_mids()
+        if disk_mids and len(disk_mids) == len(active):
             gid = next((str(a.get("gid") or "").strip() for a in active
                         if str(a.get("gid") or "").strip()), "")
             if gid:
@@ -936,17 +1034,6 @@ class TaskPanel(QWidget):
             self._finish_card(key, d)
             live.pop(idx)
 
-        # ⚠️ 每轮结束都要压一次上限：只挂在「有任务完成」的分支里是不够的 ——
-        # 某一轮如果只新增任务、没有完成的，卡片数会一路涨过上限。
-        # 卡住的进行中卡片先定格成「已终止」（否则它既不会被修剪也清不掉）
-        self._finalize_stale(claimed)
-        # _prune_finished 只动「已完成」的卡片，对进行中的无影响，无条件调用是安全的。
-        self._prune_finished()
-        # 兜底：不在 `_cards` 里的卡片控件一律收掉（漏过一次就会留点不掉的幽灵卡）
-        self._sweep_orphan_widgets()
-        self._reorder_cards()
-        # 上报本次运行累计进度 → 下载统计按**实际发生的时间**分账（跨零点分记两天）
-        self._emit_progress()
 
     def _reorder_cards(self) -> None:
         """按消息 id 升序排列卡片（id 拿不到的排在最后）。
@@ -1351,7 +1438,7 @@ class TaskPanel(QWidget):
         """卡片标题：**最终落盘的文件名** —— `{群组号}_{消息号}_{文件名}`。
 
         tdl 的 --template 是 `{{ .DialogID }}_{{ .MessageID }}_{{ .FileName }}`，
-        下载产物就叫 `1539539150_95292_8月25日(2).mp4`。标题按同样的三段式拼出
+        下载产物就叫 `1234567890_12345_8月25日(2).mp4`。标题按同样的三段式拼出
         同一个名字，用户可以直接拿它去下载目录对照（此前用「群号 #序号  文件名」
         的自创格式，与真实文件名对不上，用户明确要求改成一致）。
 

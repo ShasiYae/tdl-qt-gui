@@ -15,11 +15,9 @@ import ctypes
 import hashlib
 import json
 import os
-import re
 import shutil
 import socket
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -395,26 +393,64 @@ def write_tdl_wrapper(proxy: str, install_dir: Path) -> Path:
     return bat
 
 
+def _bat_quote(v: str) -> str:
+    """把值安全地放进 .bat 的双引号里。
+
+    ⚠️ 只加引号**不够**（v2.13.8 实测）：值里如果本来含 `"`，会把引号提前闭合，
+    后面的 `& del x` 就逃出去被 cmd 当命令执行。
+    cmd 的规则是「双引号内的 `"` 用 `""` 转义」，所以把内部引号翻倍即可。
+    """
+    return '"' + str(v).replace('"', '""') + '"'
+
+
 def open_login_terminal(mode: str, ns: str, proxy: str, exe: str) -> str:
     """新控制台窗口跑交互式登录（验证码 / 扫码都需要键盘输入），返回命令行。
 
     bat 用 GBK 落盘 —— cmd.exe 按 ANSI 代码页解析脚本，UTF-8 中文会乱码。
     """
-    args = [f'"{exe}"']
-    if ns:
-        args.append(f"-n {ns}")
-    if proxy:
-        args.append(f'--proxy "{proxy}"')
-    args.append(f"login -T {mode}")
-    cmd = " ".join(args)
+    # ⚠️ 拼进 .bat 的每个值都必须转义引号（v2.13.8 修）：
+    #   这个字符串会被 cmd.exe 解释。`-n x & calc` 不加引号时 `&` 是命令分隔符
+    #   → 可执行任意命令（已实证）；而只加引号、值里自带 `"` 时仍能闭合逃逸
+    #   （也已实证）。代理地址是用户手输的，必须按最坏情况处理。
+    cmd = login_command_text(mode, ns, proxy, exe)
     bat = Path(tempfile.gettempdir()) / f"tdl-login-{int(time.time())}.bat"
     body = "@echo off\r\nchcp 65001 >nul\r\n" + cmd + "\r\npause\r\n"
     try:
         bat.write_text(body, encoding="gbk")
     except UnicodeEncodeError:
         bat.write_text(body, encoding="gbk", errors="replace")
-    subprocess.Popen(["cmd", "/c", "start", "", "tdl login", str(bat)])
+    try:
+        # ⚠️⚠️ `start` 的参数顺序是 `start "窗口标题" 程序 [参数]`（v2.13.8 修）：
+        #   原来写的是 ["cmd","/c","start","","tdl login", bat] —— 那个 `"tdl login"`
+        #   被 start 当成**窗口标题**，于是真正的「程序」变成了 bat 路径、但前面
+        #   还留着 "tdl login" 当命令 → 系统找不到名为 `tdl login` 的文件，
+        #   弹出「Windows 找不到文件 'tdl login'」。用户点「登录」必然踩到。
+        #   正确：标题 + 用 cmd /c 调用 bat（bat 内部已 chcp 65001 + pause）。
+        p = subprocess.Popen(
+            ["cmd", "/c", "start", "tdl login", "cmd", "/c", str(bat)]
+        )
+        # ⚠️ **必须回收句柄**（v2.13.6 修）：原来 Popen 的返回值被直接丢弃，
+        # 没有 wait/poll → Windows 下每点一次「登录」就泄漏一个僵尸句柄，
+        # 直到 GUI 退出才释放（用户有已跑 8 小时以上的会话）。
+        threading.Thread(target=p.wait, daemon=True).start()
+    except OSError:
+        pass                                     # 起不来不影响返回命令行给用户手抄
     return cmd
+
+
+def login_command_text(mode: str, ns: str, proxy: str, exe: str) -> str:
+    """只拼命令行文本、**不启动任何窗口**（用于显示给用户手抄 / 单元测试）。
+
+    ⚠️ 测试与自检必须用这个，别调 `open_login_terminal` —— 后者会真的开 cmd 窗口
+    （我自己踩过：验证注入时弹出一个「找不到文件」的窗）。
+    """
+    args = [_bat_quote(exe)]
+    if ns:
+        args.append(f'-n {_bat_quote(ns)}')
+    if proxy:
+        args.append(f'--proxy {_bat_quote(proxy)}')
+    args.append(f"login -T {_bat_quote(mode)}")
+    return " ".join(args)
 
 
 # ============================================================ 系统时间

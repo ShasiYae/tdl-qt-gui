@@ -24,19 +24,16 @@
 from __future__ import annotations
 
 import datetime
-import difflib
 import hashlib
 import html
-import json
 import math
 import re
-import shutil
 import subprocess
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QUrl, QSize, QPoint, Signal
+from PySide6.QtCore import Qt, QTimer, QUrl, QPoint, Signal
 from PySide6.QtGui import (
-    QColor, QCursor, QDesktopServices, QFontMetrics, QGuiApplication, QPainter, QPixmap,
+    QCursor, QDesktopServices, QGuiApplication, QPixmap,
 )
 from PySide6.QtWidgets import (
     QDialog, QFrame, QFileDialog, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
@@ -45,7 +42,7 @@ from PySide6.QtWidgets import (
 
 from . import paths
 from .media_tools import ffmpeg_path, ffprobe_path           # noqa: F401（对外仍可用）
-from .media_viewer import HAVE_QTMM, _qt_alive, is_viewable, open_media
+from .media_viewer import _qt_alive, is_viewable, open_media
 from .msg_cache import SlimError, load_messages
 from .msg_dedup import dedup_keep_ends
 from .task_panel import fmt_bytes_dec
@@ -1157,7 +1154,7 @@ class MsgBrowser(QWidget):
 
         ⚠️ **单实例复用**（10-11 改）：已有实例就**直接复用**（换媒体列表 + 切到目标项），
         而不是新建一个。原因见 `_viewer` 的注释：用户习惯「看完一个关掉、再点下一个」，
-        每次新建都会重建一整套 WMF 解码后端 —— 日志实测两分钟开关 8 次，
+        每次新建都会重建一整套 WMF 解码后端 —— 日志实测短时间内反复开关，
         第 9 次创建时 access violation。复用之后后端只在第一次打开时建一次。
         """
         # 崩溃日志上下文：万一打开查看器时崩了，能一眼看出崩在什么类型的文件上

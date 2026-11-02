@@ -12,15 +12,14 @@ DOM 对应原型的 .actions（执行/重置）+ .cmdbar（等效命令）+ 日�
 """
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal, QTimer
+from PySide6.QtCore import Signal
 from PySide6.QtGui import QFont, QTextCursor, QColor, QTextCharFormat, QGuiApplication
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPlainTextEdit,
-    QPushButton, QSizePolicy, QScrollBar, QLineEdit,
+    QPushButton, QSizePolicy, QLineEdit,
 )
 
 from .theme import T
-from .icons import ICONS
 
 
 # ============================================================================

@@ -14,7 +14,7 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, Signal, QSize, QRect, QEvent, QObject
 from PySide6.QtGui import QPainter, QColor, QPen, QFont, QFontMetrics
 from PySide6.QtWidgets import (
-    QWidget, QHBoxLayout, QLabel, QSizePolicy, QPushButton,
+    QWidget, QHBoxLayout, QLabel, QSizePolicy,
     QAbstractButton, QAbstractSpinBox, QComboBox, QLineEdit,
     QPlainTextEdit, QTextEdit,
 )
