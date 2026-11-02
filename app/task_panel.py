@@ -618,7 +618,7 @@ class TaskPanel(QWidget):
         self._restart = False                      # --restart：tdl 重下全部（不做已存在排除）
         self._done_mids: set[str] = set()          # 磁盘上「已下载完成」的消息号（按目录 stat 缓存）
         # 上面那个缓存的失效判据 (目录 st_mtime_ns, st_size)；None = 还没算过。
-        # ⚠️ commit_round 每秒跑 10 次，未缓存时每次都要列举 2 万个文件名（19 ms）。
+        # ⚠️ commit_round 每秒跑 10 次，未缓存时每次都要列举上万条文件名（19 ms）。
         self._done_mids_sig: tuple | None = None
         # 本次运行累计进度回调 `fn(total_bytes, task_count)` —— 下载统计据此
         # **按实际发生的时间**分账（见 stats.add_progress）；None 时不做任何事。
